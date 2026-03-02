@@ -1,0 +1,41 @@
+{
+  "_schema_version": "0.1",
+  "_description": "Authoritative registry of external document corpora evaluated for ingestion. Each entry records evaluation results and the provenance tag assigned to chunks from that corpus. This file is version-controlled. Do not add entries without running corpus_evaluator.py first.",
+  "_provenance_tags": [
+    "PROVENANCE_DOJ_DIRECT",
+    "PROVENANCE_HASH_VERIFIED",
+    "PROVENANCE_COMMUNITY_VOUCHED",
+    "PROVENANCE_UNVERIFIED",
+    "PROVENANCE_FLAGGED",
+    "PROVENANCE_REJECTED"
+  ],
+  "_git_integrity_scores": [
+    "CLEAN",
+    "REVIEW_RECOMMENDED",
+    "REJECTED"
+  ],
+  "corpora": [
+    {
+      "_comment": "This is a placeholder entry showing the required schema. Replace with real evaluated corpora.",
+      "corpus_id": "PLACEHOLDER-001",
+      "status": "PLACEHOLDER",
+      "github_url": null,
+      "evaluated_commit_hash": null,
+      "evaluation_date": null,
+      "evaluator": null,
+      "document_types_covered": [],
+      "has_bates_stamps": null,
+      "bates_coverage_pct": null,
+      "page_count_claimed": null,
+      "page_count_verified": null,
+      "git_integrity_score": null,
+      "git_integrity_notes": null,
+      "community_endorsed": false,
+      "endorsing_orgs": [],
+      "license": null,
+      "license_notes": null,
+      "provenance_tag_assigned": null,
+      "ingestion_notes": "Placeholder — do not ingest"
+    }
+  ]
+}

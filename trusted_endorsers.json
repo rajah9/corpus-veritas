@@ -1,0 +1,29 @@
+{
+  "_schema_version": "0.1",
+  "_description": "Registry of journalists, news organizations, and researchers whose use of or citation of a corpus upgrades its provenance tag from PROVENANCE_UNVERIFIED to PROVENANCE_COMMUNITY_VOUCHED. Maintain this list carefully — an endorser's trustworthiness is what gives the upgrade meaning.",
+  "_note": "Endorsement is not the same as verification. A COMMUNITY_VOUCHED corpus has been used or cited by a trusted source AND has passed Bates reconciliation. It does not mean the corpus has been cryptographically verified against DOJ originals.",
+  "endorsers": [
+    {
+      "id": "NPR",
+      "name": "NPR (National Public Radio)",
+      "type": "news_organization",
+      "notes": "Published February 2026 investigation identifying ~53 missing pages via serial number, discovery log, and document stamp reconciliation. Methodology documented and replicable.",
+      "reference_url": "https://www.npr.org"
+    },
+    {
+      "id": "MURKROCK",
+      "name": "MuckRock",
+      "type": "journalism_platform",
+      "notes": "Specialist FOIA and government document platform. Document releases verified against original filings.",
+      "reference_url": "https://www.muckrock.com"
+    },
+    {
+      "_comment": "Add additional endorsers as the project develops. Include the basis for trust.",
+      "id": "PLACEHOLDER",
+      "name": "Placeholder — replace with real endorsers",
+      "type": null,
+      "notes": null,
+      "reference_url": null
+    }
+  ]
+}
