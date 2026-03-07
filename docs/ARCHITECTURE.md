@@ -1,9 +1,9 @@
 # Architecture Specification
 
 *Epstein Files AI Analysis System — corpus-veritas*
-*Version 0.1 — February 2026*
+*Version 0.2 — March 2026*
 
-> This document is the technical companion to [`CONSTITUTION.md`](../CONSTITUTION.md). Ethical boundaries defined there govern all decisions here. When they conflict, the Constitution governs.
+> This document is the technical companion to [`CONSTITUTION.md`](../../../Downloads/corpus-veritas-deletion-detector/corpus-veritas/CONSTITUTION.md). Ethical boundaries defined there govern all decisions here. When they conflict, the Constitution governs.
 
 ---
 
@@ -73,18 +73,49 @@ Using the GitHub API, pull full commit history. Flag repos where:
 
 Output: `GIT_INTEGRITY` score.
 
-**Check 2 — Bates Stamp Reconciliation**
+**Check 2 — Sequence Number Reconciliation**
 
-Extract every Bates number from the corpus. Compare against DOJ index manifest. Produce three counts:
+Extract sequence numbers from the corpus using the appropriate `SequenceNumber` scheme and reconcile against the DOJ index manifest. The DOJ Epstein release uses **EFTA numbers** (per-page, sequential across all datasets) — not traditional Bates stamps. Pass an `EFTANumber` instance for Epstein corpora; `BatesNumber` remains supported for other legal corpora.
+
+Produces four counts/lists:
 - `PRESENT` — in both index and corpus
-- `MISSING_FROM_CORPUS` — in index, not in corpus (feeds deletion detection)
+- `MISSING_FROM_CORPUS` — in index, not in corpus
 - `UNINDEXED` — in corpus, not in index (flag for review)
+- `DELETION_CANDIDATES` — missing numbers *excluding* documented expected gaps (see EFTA note below)
 
 Corpora covering <60% of the index are tagged `PARTIAL_COVERAGE`.
 
 **Check 3 — Community Vetting**
 
 Cross-reference against `trusted_endorsers.json`. Endorsement upgrades `PROVENANCE_UNVERIFIED` to `PROVENANCE_COMMUNITY_VOUCHED`.
+
+#### Sequence Numbering Schemes (`pipeline/sequence_numbers.py`)
+
+The DOJ Epstein release does not use traditional Bates stamps. It uses **EFTA numbers** — assigned per-page (not per-document), sequential across all 12 datasets with no resets at dataset boundaries. This required a scheme-agnostic abstraction.
+
+```
+SequenceNumber (ABC)
+├── BatesNumber   — traditional legal stamping; all gaps are suspicious
+└── EFTANumber    — EFTA per-page numbering; DS9 gaps are documented/expected
+```
+
+The shared reconciliation algorithm (`SequenceNumber.reconcile()`) lives on the base class. Subclasses override only five methods that capture scheme-specific behaviour:
+
+| Method | BatesNumber | EFTANumber |
+|---|---|---|
+| `scheme_name` | `"BATES"` | `"EFTA"` |
+| `validate()` | Matches `PREFIX-DIGITS` or 6+ digit strings | Positive integer strings only |
+| `extract_from_text()` | Regex for Bates stamp patterns | Regex for `EFTA-NNNN` variants |
+| `sort_key()` | `(prefix_str, int)` tuple | `int` |
+| `gap_is_expected()` | Always `False` | `True` for DS9 documented gaps |
+
+**The DS9 gap distinction is critical.** The rhowardstone analysis identified 692,473 EFTA numbers in DS9's range that have no corresponding document in the release. Their status is unknown (withheld, unimaged, or unused tracking slots) but their absence is documented. They must appear in `ReconciliationResult.expected_gap_numbers`, not `deletion_candidates` — otherwise the deletion detector generates thousands of false alarms.
+
+`ReconciliationResult` replaces the former `BatesReconciliationResult` and adds:
+- `expected_gap_numbers` — documented absences, not escalated to deletion detection
+- `deletion_candidates` — true gaps that feed `deletion_detector.py` as `DELETION_SUSPECTED`
+
+The invariant `expected_gap_numbers ∪ deletion_candidates = missing_numbers` is enforced by contract tests in `TestSequenceSchemeContract`.
 
 #### Sub-Module 1C: PII Sanitization
 
@@ -112,7 +143,7 @@ Three systems in concert:
 | System | Purpose |
 |---|---|
 | **Amazon S3** | Raw document storage. Versioned. Object Lock on victim-flagged content. |
-| **DynamoDB** | Document registry, entity table, corpus registry, audit log, deletion manifest. |
+| **DynamoDB** | Document registry, entity table, corpus registry, audit log, deletion manifest. Stores `WithholdingRecord` and `DeletionRecord` objects from `pipeline/deletion_detector.py`. |
 | **OpenSearch Serverless** | Vector store. Every chunk carries the full metadata schema below. |
 
 #### Chunk Metadata Schema
@@ -122,7 +153,8 @@ Every chunk embedded into OpenSearch carries:
 | Field | Values |
 |---|---|
 | `source_document_uuid` | UUID from DynamoDB registry |
-| `bates_number` | Extracted Bates stamp, or `NULL` |
+| `sequence_number` | Extracted EFTA number (primary) or Bates stamp; `NULL` if absent |
+| `sequence_scheme` | `"EFTA"` \| `"BATES"` \| `NULL` |
 | `document_date` | ISO 8601 |
 | `document_type` | `FBI_302` \| `CORRESPONDENCE` \| `COURT_FILING` \| `EXHIBIT` \| `OTHER` |
 | `named_entities` | JSON array of NER extractions with type and confidence |
@@ -216,12 +248,20 @@ Implements methodology from NPR's February 2026 investigation. Three independent
 
 #### Deletion Flag Taxonomy
 
-| Flag | Signals Required | Description |
-|---|---|---|
-| `DELETION_CONFIRMED` | 3 | All three signals confirm absence |
-| `DELETION_SUSPECTED` | 2 | Bates gap + one other signal |
-| `DELETION_POSSIBLE` | 1 | Single-signal only |
-| `REFERENCE_UNRESOLVED` | 0 | Internal cross-reference target missing; no index confirmation |
+Flags live in `pipeline/models.py` as `DeletionFlag(str, Enum)`. They support ordering operators (`<`, `>`, `<=`, `>=`) — government-acknowledged flags rank above evidence-graded flags.
+
+| Flag | Signals / Basis | Confidence Tier | Human Review? |
+|---|---|---|---|
+| `REFERENCE_UNRESOLVED` | Internal reference, no index entry | `SPECULATIVE` | Yes |
+| `DELETION_POSSIBLE` | 1 signal | `SINGLE_SOURCE` | Yes |
+| `DELETION_SUSPECTED` | 2 signals | `CORROBORATED` | No |
+| `DELETION_CONFIRMED` | 3 signals | `CONFIRMED` | No |
+| `WITHHELD_SELECTIVELY` | Gov't confirmed; sibling docs released | `CONFIRMED` | No |
+| `WITHHELD_ACKNOWLEDGED` | Gov't confirmed; no siblings required | `CONFIRMED` | No |
+
+`WITHHELD_SELECTIVELY` and `WITHHELD_ACKNOWLEDGED` were added following the WSJ's March 2026 reporting that the DOJ confirmed 47,635 files were held offline pending review, and that three FBI 302s from a Trump-related interview series were withheld while a fourth was released.
+
+The government's characterisation of withheld documents (e.g. claims described as "baseless") is stored as `WithholdingRecord.stated_reason` — the DOJ's stated position, not a system finding.
 
 #### FBI 302 Partial Delivery
 
