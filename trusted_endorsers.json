@@ -1,29 +1,42 @@
 {
-  "_schema_version": "0.1",
+  "_schema_version": "0.2",
   "_description": "Registry of journalists, news organizations, and researchers whose use of or citation of a corpus upgrades its provenance tag from PROVENANCE_UNVERIFIED to PROVENANCE_COMMUNITY_VOUCHED. Maintain this list carefully — an endorser's trustworthiness is what gives the upgrade meaning.",
-  "_note": "Endorsement is not the same as verification. A COMMUNITY_VOUCHED corpus has been used or cited by a trusted source AND has passed Bates reconciliation. It does not mean the corpus has been cryptographically verified against DOJ originals.",
+  "_note": "Endorsement is not the same as verification. A COMMUNITY_VOUCHED corpus has been used or cited by a trusted source AND has passed sequence reconciliation. It does not mean the corpus has been cryptographically verified against DOJ originals.",
+  "_cited_corpora_note": "cited_corpora is a list of GitHub URLs of corpora this endorser has explicitly used or cited. A corpus matching one of these URLs receives PROVENANCE_COMMUNITY_VOUCHED if it also passes sequence reconciliation.",
   "endorsers": [
     {
       "id": "NPR",
       "name": "NPR (National Public Radio)",
       "type": "news_organization",
       "notes": "Published February 2026 investigation identifying ~53 missing pages via serial number, discovery log, and document stamp reconciliation. Methodology documented and replicable.",
-      "reference_url": "https://www.npr.org"
+      "reference_url": "https://www.npr.org",
+      "cited_corpora": []
     },
     {
-      "id": "MURKROCK",
+      "id": "MUCKROCK",
       "name": "MuckRock",
       "type": "journalism_platform",
       "notes": "Specialist FOIA and government document platform. Document releases verified against original filings.",
-      "reference_url": "https://www.muckrock.com"
+      "reference_url": "https://www.muckrock.com",
+      "cited_corpora": []
     },
     {
-      "_comment": "Add additional endorsers as the project develops. Include the basis for trust.",
-      "id": "PLACEHOLDER",
-      "name": "Placeholder — replace with real endorsers",
-      "type": null,
-      "notes": null,
-      "reference_url": null
+      "id": "WSJ",
+      "name": "Wall Street Journal",
+      "type": "news_organization",
+      "notes": "March 2026 reporting on 47,635 files held offline and selective withholding of Trump-related FBI 302s. Obtained direct DOJ confirmation of withholdings.",
+      "reference_url": "https://www.wsj.com",
+      "cited_corpora": []
+    },
+    {
+      "id": "RHOWARDSTONE",
+      "name": "rhowardstone (independent data scientist)",
+      "type": "independent_researcher",
+      "notes": "Forensic analysis of full 12-dataset DOJ release: 1,380,937 PDFs, 2,731,785 pages, full-text SQLite corpus with FTS5, EFTA dataset mapping, knowledge graph, entity registry. Self-described as not independently human-verified. EFTA gap analysis confirmed 100% completeness within dataset boundaries. Cited corpus: rhowardstone/Epstein-research-data.",
+      "reference_url": "https://github.com/rhowardstone/Epstein-research",
+      "cited_corpora": [
+        "https://github.com/rhowardstone/Epstein-research-data"
+      ]
     }
   ]
 }

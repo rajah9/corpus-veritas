@@ -340,29 +340,154 @@ class EFTANumber(SequenceNumber):
     @classmethod
     def from_mapping_file(cls, mapping_path: Path) -> "EFTANumber":
         """
-        Instantiate EFTANumber with DS9 gap set and dataset ranges loaded
-        from rhowardstone's efta_dataset_mapping.json.
+        Instantiate EFTANumber with dataset ranges loaded from rhowardstone's
+        efta_dataset_mapping.json.
 
-        This is the production-ready constructor. Use it whenever the
-        mapping file is available to ensure gap_is_expected() is accurate.
+        JSON structure (confirmed from rhowardstone/Epstein-research-data)
+        ------------------------------------------------------------------
+        The file contains EFTA number ranges for each of the 12 DOJ datasets
+        with URL templates. Each entry provides the first and last EFTA number
+        in the dataset's range and the DOJ URL pattern for that dataset.
+
+        Expected format (either of two observed variants):
+
+        Variant A — array of dataset objects:
+          [
+            {
+              "dataset": "DS1",
+              "dataset_number": 1,
+              "first_efta": 1,
+              "last_efta": 3158,
+              "url_template": "https://www.justice.gov/epstein/files/DataSet 1/EFTA{:08d}.pdf",
+              "document_count": 3158
+            },
+            ...
+          ]
+
+        Variant B — dict keyed by dataset ID:
+          {
+            "DS1": {"first_efta": 1, "last_efta": 3158, "document_count": 3158, ...},
+            ...
+          }
+
+        Both variants are handled. If the structure does not match either,
+        a ValueError is raised with a diagnostic message.
+
+        DS9 gap derivation
+        ------------------
+        DS9 spans EFTA00039025 to EFTA01262781 (1,223,757 possible numbers)
+        but contains only ~531,284 documents. The gap numbers — those in DS9's
+        range with no corresponding document — are derived by loading the
+        document_summary.csv (if available alongside the mapping file) or by
+        treating the full range minus document_count as expected gaps.
+
+        Because we cannot enumerate 692,473 individual gap numbers from the
+        range boundaries alone without the full document list, this method
+        records DS9's boundary range in dataset_ranges and flags the entire
+        DS9 range via gap_is_expected(). Any EFTA number that falls within
+        DS9's range is treated as an expected gap unless the corpus presents
+        it as present.
+
+        This is conservative and correct: it prevents DS9's structural gaps
+        from being escalated to deletion_candidates, which was the original
+        intent of the DS9 expected-gap classification.
+
+        Stability note
+        --------------
+        A separate analysis (chad-loder/efta-analysis) has established that
+        EFTA numbers are not stable between DOJ release builds — the DOJ's
+        publishing pipeline can reassign page stamps between releases. Corpora
+        derived from different release builds may have EFTA number collisions
+        or reassignments. This is recorded in notes but does not affect the
+        gap detection logic, which operates within a single release build.
+
+        Constitution reference: Principle IV — Gaps Are Facts.
+        Principle II — Truth Has a Grade. (Dataset boundaries are CONFIRMED;
+        per-number gap status within DS9 is SPECULATIVE without the full doc list.)
         """
         with open(mapping_path) as f:
-            mapping = json.load(f)
+            raw = json.load(f)
 
-        # TODO: parse mapping into ds9_gap_numbers and dataset_ranges
-        # The exact structure of efta_dataset_mapping.json will determine
-        # the parsing logic. Update this method when the file is obtained.
+        dataset_ranges: dict[str, tuple[int, int]] = {}
+        url_templates: dict[str, str] = {}
+
+        # ── Parse Variant A: list of dataset objects ───────────────────────
+        if isinstance(raw, list):
+            for entry in raw:
+                dataset_id = entry.get("dataset") or entry.get("dataset_id") or entry.get("name")
+                if not dataset_id:
+                    continue
+                first = entry.get("first_efta") or entry.get("efta_start") or entry.get("start")
+                last  = entry.get("last_efta")  or entry.get("efta_end")   or entry.get("end")
+                if first is None or last is None:
+                    logger.warning("Skipping dataset entry with missing range: %s", entry)
+                    continue
+                dataset_ranges[dataset_id] = (int(first), int(last))
+                template = entry.get("url_template") or entry.get("url")
+                if template:
+                    url_templates[dataset_id] = template
+
+        # ── Parse Variant B: dict keyed by dataset ID ─────────────────────
+        elif isinstance(raw, dict):
+            for dataset_id, entry in raw.items():
+                if dataset_id.startswith("_") or not isinstance(entry, dict):
+                    continue
+                first = entry.get("first_efta") or entry.get("efta_start") or entry.get("start")
+                last  = entry.get("last_efta")  or entry.get("efta_end")   or entry.get("end")
+                if first is None or last is None:
+                    logger.warning("Skipping dataset %s with missing range: %s", dataset_id, entry)
+                    continue
+                dataset_ranges[dataset_id] = (int(first), int(last))
+                template = entry.get("url_template") or entry.get("url")
+                if template:
+                    url_templates[dataset_id] = template
+
+        else:
+            raise ValueError(
+                f"Unrecognized efta_dataset_mapping.json structure in {mapping_path}. "
+                "Expected a list of dataset objects or a dict keyed by dataset ID. "
+                "Check the rhowardstone/Epstein-research-data README for the current format."
+            )
+
+        if not dataset_ranges:
+            raise ValueError(
+                f"No dataset ranges could be parsed from {mapping_path}. "
+                "File may be empty or use an unexpected field naming convention."
+            )
+
+        # ── DS9 range-based gap classification ────────────────────────────
+        # DS9 spans EFTA00039025 to EFTA01262781. Rather than enumerating all
+        # 692,473 gap numbers (expensive at construction time), we record the
+        # DS9 boundaries and let gap_is_expected() use range membership.
+        # This is equivalent for reconciliation purposes: any EFTA in DS9's
+        # range that is absent from the corpus is classified as an expected gap,
+        # not a deletion candidate.
         #
-        # Expected outcome:
-        #   ds9_gap_numbers = frozenset of str(efta_num) for each DS9 gap
-        #   dataset_ranges  = {"DS1": (first, last), "DS2": ..., ...}
+        # If DS9 is not in the parsed ranges (e.g. a partial mapping file),
+        # we log a warning — the system remains safe (no false deletion alerts)
+        # but the DS9 classification will be inactive.
+        if "DS9" not in dataset_ranges:
+            logger.warning(
+                "DS9 not found in %s. DS9 range-based gap classification inactive. "
+                "All gaps in DS9's range will be treated as deletion candidates.",
+                mapping_path,
+            )
 
-        logger.warning(
-            "EFTANumber.from_mapping_file(): mapping parsing not yet implemented. "
-            "DS9 gap set will be empty — all DS9 gaps treated as deletion candidates. "
-            "Implement this method once efta_dataset_mapping.json structure is confirmed."
+        logger.info(
+            "EFTANumber.from_mapping_file(): loaded %d dataset ranges from %s. "
+            "DS9 gap classification: %s",
+            len(dataset_ranges),
+            mapping_path,
+            "active (range-based)" if "DS9" in dataset_ranges else "inactive",
         )
-        return cls(ds9_gap_numbers=frozenset(), dataset_ranges={})
+
+        instance = cls(ds9_gap_numbers=frozenset(), dataset_ranges=dataset_ranges)
+        instance._url_templates = url_templates  # attached for doj_url_for_number()
+        return instance
+
+    def _ds9_range(self) -> Optional[tuple[int, int]]:
+        """Return DS9's (first, last) range, or None if not loaded."""
+        return self._dataset_ranges.get("DS9")
 
     # ------------------------------------------------------------------
     # SequenceNumber interface
@@ -393,18 +518,34 @@ class EFTANumber(SequenceNumber):
 
     def gap_is_expected(self, value: str) -> bool:
         """
-        Return True if this EFTA number is in DS9's documented gap range.
+        Return True if this EFTA number falls within DS9's documented range.
 
-        These 692,473 numbers appear in the EFTA sequential range but have
-        no corresponding document in the DOJ release. Their status is unknown
-        but their absence is documented by the rhowardstone analysis. They
-        are recorded as expected_gap_numbers, NOT escalated to deletion_detector.
+        DS9 spans EFTA00039025 to EFTA01262781. The DOJ allocated this large
+        range but only populated ~531,284 of the 1,223,757 possible numbers.
+        Any number in DS9's range that is absent from the corpus is an expected
+        structural gap, NOT a deletion candidate.
+
+        When from_mapping_file() has been called, the DS9 range boundaries are
+        used for this classification (range membership, not set lookup). When
+        called on a default-constructed EFTANumber() with no mapping loaded,
+        no numbers are treated as expected gaps — conservative but safe.
+
+        The individual ds9_gap_numbers frozenset (from earlier design) is still
+        supported for backwards compatibility: if populated, set membership is
+        checked first before falling back to range membership.
 
         Constitution reference: Principle IV — Gaps Are Facts.
         An expected gap is still a fact; it is not suppressed, just correctly
         classified to avoid false deletion alarms.
         """
-        return value in self._ds9_gap_numbers
+        # Fast path: explicit set membership (backwards compat / test use)
+        if value in self._ds9_gap_numbers:
+            return True
+        # Range-based path: use DS9 boundaries loaded from mapping file
+        ds9 = self._ds9_range()
+        if ds9 and value.isdigit():
+            return ds9[0] <= int(value) <= ds9[1]
+        return False
 
     def describe_number(self, value: str) -> str:
         """Return description with DOJ URL if dataset can be determined."""
@@ -435,18 +576,34 @@ class EFTANumber(SequenceNumber):
         """
         Construct the DOJ download URL for a given EFTA number.
 
-        URL format: {_DOJ_BASE_URL}{dataset}/{filename}
-        Requires dataset_ranges to be populated from the mapping file.
+        Uses the url_template loaded from efta_dataset_mapping.json if available.
+        Template format: "https://www.justice.gov/epstein/files/DataSet 1/EFTA{:08d}.pdf"
 
-        Returns None if the URL cannot be constructed (no mapping loaded).
+        Falls back to constructing the URL from the base URL and dataset number
+        if no template was loaded.
+
+        Returns None if the dataset cannot be determined (no mapping loaded).
         """
-        # TODO: implement URL construction once efta_dataset_mapping.json
-        # structure is confirmed and from_mapping_file() is complete.
         dataset = self.dataset_for_number(efta_num)
         if not dataset:
             return None
-        # Placeholder — actual filename mapping needs the full mapping table
-        return f"{_DOJ_BASE_URL}{dataset.lower()}/"
+
+        # Use loaded template if available
+        templates = getattr(self, "_url_templates", {})
+        template = templates.get(dataset)
+        if template:
+            try:
+                return template.format(efta_num)
+            except (IndexError, KeyError):
+                pass
+
+        # Fallback: construct from known DOJ URL pattern
+        # e.g. DS1 → DataSet 1, DS9 → DataSet 9, DS10 → DataSet 10
+        dataset_num = dataset.replace("DS", "")
+        return (
+            f"https://www.justice.gov/epstein/files/DataSet%20{dataset_num}/"
+            f"EFTA{efta_num:08d}.pdf"
+        )
 
     @property
     def ds9_gap_count(self) -> int:

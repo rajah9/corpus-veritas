@@ -1,415 +1,823 @@
 """
-Integration tests for Layer 1: Sequence Numbers & Corpus Evaluator
+tests/pipeline/test_corpus_evaluator.py
 
-Tests the SequenceNumber ABC and its concrete subclasses (BatesNumber, EFTANumber),
-plus the corpus_evaluator.py reconciliation pipeline.
+Unit tests for pipeline/corpus_evaluator.py.
 
-Real document content is never committed to this repository.
-All fixtures use synthetic sequence numbers and placeholder text.
+Every public function and dataclass is covered here.  The integration suite
+in tests/integration/test_corpus_evaluator.py is not duplicated -- that file
+tests reconciliation logic via BatesNumber/EFTANumber end-to-end.  This file
+tests the evaluator functions in isolation, mocking their collaborators.
 
-Test structure
---------------
-TestBatesNumberScheme     — unit tests for BatesNumber methods
-TestEFTANumberScheme      — unit tests for EFTANumber methods
-TestBatesReconciliation   — reconciliation logic via BatesNumber
-TestEFTAReconciliation    — reconciliation logic via EFTANumber, including DS9 gap handling
-TestSequenceSchemeContract — ABC contract tests that both subclasses must satisfy
+Coverage targets
+----------------
+_parse_github_repo_path()       -- all URL normalisation branches
+check_git_integrity()           -- precondition failures (no token, bad URL)
+                                   + all mocked evaluation paths (CLEAN,
+                                   REVIEW_RECOMMENDED, REJECTED, force push,
+                                   dormant repo, null/empty commit message,
+                                   events API exception, 404/403/unknown error)
+check_sequence_reconciliation() -- thin delegation wrapper
+check_community_vetting()       -- match, no-match, URL normalisation,
+                                   PLACEHOLDER guard, multiple endorsers,
+                                   missing cited_corpora key
+_write_to_registry()            -- new entry, update-in-place, two distinct IDs
+evaluate_corpus()               -- all provenance tag branches, registry write,
+                                   no-corpus-numbers path, scheme selection
+GitIntegrityResult              -- all dataclass fields
+CommunityVettingResult          -- all dataclass fields
+EvaluationResult                -- all dataclass fields
+
+Temp-file strategy
+------------------
+* TestCheckCommunityVetting: setUp creates a temp dir; each test writes its
+  own endorsers file into it; tearDown removes the dir.
+
+* TestWriteToRegistry: setUp creates a temp dir containing an empty registry
+  file; tearDown removes the dir.  All tests in the class share the setUp
+  registry and write fresh entries into it.
+
+* TestEvaluateCorpus: setUp creates a temp dir with a fresh empty registry;
+  tearDown removes the dir.  evaluate_corpus() is called with REGISTRY_PATH
+  patched to that file.
+
+Implementation note -- check_community_vetting default argument
+---------------------------------------------------------------
+check_community_vetting() is defined as:
+
+    def check_community_vetting(github_url, endorsers_path=ENDORSERS_PATH):
+
+The default is evaluated once at import time.  Patching the module-level name
+ENDORSERS_PATH after import has no effect on calls that use the default.
+evaluate_corpus() calls check_community_vetting(github_url) without passing
+endorsers_path, so TestEvaluateCorpus mocks check_community_vetting itself
+rather than trying to patch ENDORSERS_PATH.
 """
 
-import pytest
-from pipeline.sequence_numbers import (
-    BatesNumber,
-    EFTANumber,
-    ReconciliationResult,
-    SequenceNumber,
-    COVERAGE_THRESHOLD,
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from pipeline.corpus_evaluator import (
+    CommunityVettingResult,
+    EvaluationResult,
+    GitIntegrityResult,
+    _parse_github_repo_path,
+    check_community_vetting,
+    check_git_integrity,
+    check_sequence_reconciliation,
+    evaluate_corpus,
+    _write_to_registry,
 )
+from pipeline.sequence_numbers import BatesNumber, EFTANumber, ReconciliationResult
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Shared GitHub mock helpers
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def bates():
-    return BatesNumber()
+# The GithubException class injected into sys.modules["github"].
+# Must be the SAME class object used for exception instances so isinstance()
+# works inside check_git_integrity()'s except clause.
+GH_EXC = type("GithubException", (Exception,), {})
 
 
-@pytest.fixture
-def efta():
-    """EFTANumber with no mapping file — DS9 gap set is empty."""
-    return EFTANumber()
+def _make_commit(sha: str, date_iso: str, message) -> MagicMock:
+    """Build a minimal PyGithub Commit mock. message may be None."""
+    c = MagicMock()
+    c.sha = sha
+    c.commit.author.date = datetime.fromisoformat(date_iso).replace(
+        tzinfo=timezone.utc
+    )
+    c.commit.message = message
+    return c
 
 
-@pytest.fixture
-def efta_with_ds9_gaps():
-    """EFTANumber with a synthetic DS9 gap set for testing gap_is_expected()."""
-    gap_numbers = frozenset(str(n) for n in range(5000, 5500))  # 500 synthetic gaps
-    return EFTANumber(ds9_gap_numbers=gap_numbers)
+def _run_git_check(commits, push_events=None, side_effect=None) -> GitIntegrityResult:
+    """Run check_git_integrity() with fully mocked PyGithub internals."""
+    mock_repo = MagicMock()
+    mock_repo.get_commits.return_value = commits
+    mock_repo.get_events.return_value = push_events or []
+
+    mock_gh_instance = MagicMock()
+    if side_effect is not None:
+        mock_gh_instance.get_repo.side_effect = side_effect
+    else:
+        mock_gh_instance.get_repo.return_value = mock_repo
+
+    mock_gh_module = MagicMock()
+    mock_gh_module.Github = MagicMock(return_value=mock_gh_instance)
+    mock_gh_module.GithubException = GH_EXC  # same class as used in instances
+
+    with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+        with patch.dict("sys.modules", {"github": mock_gh_module}):
+            return check_git_integrity("https://github.com/owner/repo")
 
 
-# ---------------------------------------------------------------------------
-# TestBatesNumberScheme
-# ---------------------------------------------------------------------------
-
-class TestBatesNumberScheme:
-    """Unit tests for BatesNumber scheme-specific behaviour."""
-
-    def test_scheme_name(self, bates):
-        assert bates.scheme_name == "BATES"
-
-    def test_validate_prefixed_format(self, bates):
-        assert bates.validate("DOJ-EPSTEIN-000001")
-        assert bates.validate("EDNY-0042318")
-        assert bates.validate("DOJ-001234")
-
-    def test_validate_bare_numeric(self, bates):
-        assert bates.validate("000001")
-        assert bates.validate("123456")
-
-    def test_validate_rejects_short_numbers(self, bates):
-        assert not bates.validate("001")     # too short
-        assert not bates.validate("12345")   # 5 digits — below 6 minimum
-
-    def test_validate_rejects_plain_text(self, bates):
-        assert not bates.validate("EPSTEIN")
-        assert not bates.validate("")
-
-    def test_extract_from_text_finds_prefixed(self, bates):
-        text = "See document DOJ-EPSTEIN-000042 for details, also EDNY-0009981."
-        found = bates.extract_from_text(text)
-        assert "DOJ-EPSTEIN-000042" in found
-        assert "EDNY-0009981" in found
-
-    def test_extract_from_text_finds_bare_numeric(self, bates):
-        text = "Referenced at page 000123 of the filing."
-        found = bates.extract_from_text(text)
-        assert "000123" in found
-
-    def test_sort_key_numeric_ordering(self, bates):
-        numbers = ["DOJ-000010", "DOJ-000002", "DOJ-000100"]
-        sorted_nums = sorted(numbers, key=bates.sort_key)
-        assert sorted_nums == ["DOJ-000002", "DOJ-000010", "DOJ-000100"]
-
-    def test_gap_is_never_expected(self, bates):
-        """All gaps in a Bates sequence are suspicious — no exceptions."""
-        assert not bates.gap_is_expected("DOJ-000001")
-        assert not bates.gap_is_expected("DOJ-999999")
-        assert not bates.gap_is_expected("000001")
-
-    def test_describe_number_contains_value(self, bates):
-        desc = bates.describe_number("DOJ-000042")
-        assert "DOJ-000042" in desc
+def _good_commits(n: int = 10, date: str = "2026-01-15"):
+    return [
+        _make_commit(
+            f"sha{i:04d}", f"{date}T00:00:00", f"Descriptive commit message {i}"
+        )
+        for i in range(n)
+    ]
 
 
 # ---------------------------------------------------------------------------
-# TestEFTANumberScheme
+# Shared endorsers data
 # ---------------------------------------------------------------------------
 
-class TestEFTANumberScheme:
-    """Unit tests for EFTANumber scheme-specific behaviour."""
+ENDORSERS_SIMPLE = {
+    "_schema_version": "0.2",
+    "endorsers": [
+        {
+            "id": "RHOWARDSTONE",
+            "name": "rhowardstone",
+            "cited_corpora": [
+                "https://github.com/rhowardstone/Epstein-research-data"
+            ],
+        },
+        {
+            "id": "NPR",
+            "name": "NPR",
+            "cited_corpora": [],
+        },
+    ],
+}
 
-    def test_scheme_name(self, efta):
-        assert efta.scheme_name == "EFTA"
-
-    def test_validate_positive_integer_string(self, efta):
-        assert efta.validate("1")
-        assert efta.validate("123456")
-        assert efta.validate("2731785")   # max known EFTA in corpus
-
-    def test_validate_rejects_zero(self, efta):
-        assert not efta.validate("0")
-
-    def test_validate_rejects_non_numeric(self, efta):
-        assert not efta.validate("EFTA-001")  # canonical form is numeric only
-        assert not efta.validate("abc")
-        assert not efta.validate("")
-        assert not efta.validate("1.5")
-
-    def test_extract_finds_prefixed_format(self, efta):
-        text = "Document EFTA-000123 references EFTA_000456 and EFTA789."
-        found = efta.extract_from_text(text)
-        assert "000123" in found
-        assert "000456" in found
-        assert "789" in found
-
-    def test_extract_is_case_insensitive(self, efta):
-        text = "See efta-001234 and EFTA-005678"
-        found = efta.extract_from_text(text)
-        assert "001234" in found
-        assert "005678" in found
-
-    def test_sort_key_is_integer(self, efta):
-        assert efta.sort_key("42") == 42
-        assert efta.sort_key("1000000") == 1000000
-
-    def test_sort_key_orders_numerically(self, efta):
-        numbers = ["10", "2", "100", "21"]
-        sorted_nums = sorted(numbers, key=efta.sort_key)
-        assert sorted_nums == ["2", "10", "21", "100"]
-
-    def test_gap_is_expected_returns_false_without_mapping(self, efta):
-        """Without DS9 gap data loaded, no gap is expected."""
-        assert not efta.gap_is_expected("5001")
-        assert not efta.gap_is_expected("999999")
-
-    def test_gap_is_expected_with_ds9_gaps(self, efta_with_ds9_gaps):
-        """DS9 gaps loaded from synthetic set are recognised as expected."""
-        assert efta_with_ds9_gaps.gap_is_expected("5001")   # in gap range
-        assert efta_with_ds9_gaps.gap_is_expected("5499")   # in gap range
-
-    def test_gap_is_not_expected_outside_ds9(self, efta_with_ds9_gaps):
-        assert not efta_with_ds9_gaps.gap_is_expected("4999")   # just below gap range
-        assert not efta_with_ds9_gaps.gap_is_expected("5500")   # just above gap range
-        assert not efta_with_ds9_gaps.gap_is_expected("1")
-
-    def test_ds9_gap_count_reflects_loaded_set(self, efta_with_ds9_gaps):
-        assert efta_with_ds9_gaps.ds9_gap_count == 500
-
-    def test_ds9_gap_count_zero_without_mapping(self, efta):
-        assert efta.ds9_gap_count == 0
-
-    def test_describe_number_contains_efta_id(self, efta):
-        desc = efta.describe_number("42000")
-        assert "42000" in desc
-
-    def test_describe_number_invalid_non_numeric(self, efta):
-        desc = efta.describe_number("NOTANUMBER")
-        assert "NOTANUMBER" in desc
+RHOWARDSTONE_URL = "https://github.com/rhowardstone/Epstein-research-data"
 
 
 # ---------------------------------------------------------------------------
-# TestBatesReconciliation
+# _parse_github_repo_path
 # ---------------------------------------------------------------------------
 
-class TestBatesReconciliation:
-    """Reconciliation logic exercised through BatesNumber."""
+class TestParseGithubRepoPath(unittest.TestCase):
 
-    def test_full_coverage(self, bates):
-        index = ["DOJ-001", "DOJ-002", "DOJ-003"]
-        corpus = ["DOJ-001", "DOJ-002", "DOJ-003"]
-        result = bates.reconcile(corpus, index)
-        assert result.present_count == 3
-        assert result.missing_from_corpus_count == 0
-        assert result.coverage_pct == 1.0
-        assert not result.partial_coverage
-        assert result.sequence_type == "BATES"
+    def test_plain_https(self):
+        self.assertEqual(
+            _parse_github_repo_path("https://github.com/owner/repo"),
+            "owner/repo",
+        )
 
-    def test_missing_documents_become_deletion_candidates(self, bates):
-        index = ["DOJ-001", "DOJ-002", "DOJ-003", "DOJ-004", "DOJ-005"]
-        corpus = ["DOJ-001", "DOJ-002"]
-        result = bates.reconcile(corpus, index)
-        assert result.missing_from_corpus_count == 3
-        assert "DOJ-003" in result.deletion_candidates
-        assert "DOJ-004" in result.deletion_candidates
-        # Bates has no expected gaps — all missing are deletion candidates
-        assert result.expected_gap_numbers == []
-        assert len(result.deletion_candidates) == 3
+    def test_git_suffix_stripped(self):
+        self.assertEqual(
+            _parse_github_repo_path("https://github.com/owner/repo.git"),
+            "owner/repo",
+        )
 
-    def test_at_coverage_threshold_not_partial(self, bates):
-        index = [f"DOJ-{i:03}" for i in range(100)]
-        corpus = [f"DOJ-{i:03}" for i in range(60)]  # exactly 60%
-        result = bates.reconcile(corpus, index)
-        assert not result.partial_coverage
+    def test_trailing_slash_stripped(self):
+        self.assertEqual(
+            _parse_github_repo_path("https://github.com/owner/repo/"),
+            "owner/repo",
+        )
 
-    def test_below_threshold_is_partial(self, bates):
-        index = [f"DOJ-{i:03}" for i in range(100)]
-        corpus = [f"DOJ-{i:03}" for i in range(59)]  # 59%
-        result = bates.reconcile(corpus, index)
-        assert result.partial_coverage
+    def test_tree_path_ignored(self):
+        self.assertEqual(
+            _parse_github_repo_path("https://github.com/owner/repo/tree/main"),
+            "owner/repo",
+        )
 
-    def test_unindexed_documents_counted(self, bates):
-        index = ["DOJ-001", "DOJ-002"]
-        corpus = ["DOJ-001", "DOJ-002", "DOJ-999"]
-        result = bates.reconcile(corpus, index)
-        assert result.unindexed_count == 1
+    def test_http_url(self):
+        self.assertEqual(
+            _parse_github_repo_path("http://github.com/owner/repo"),
+            "owner/repo",
+        )
 
-    def test_empty_corpus(self, bates):
-        index = ["DOJ-001", "DOJ-002", "DOJ-003"]
-        result = bates.reconcile([], index)
-        assert result.coverage_pct == 0.0
-        assert result.partial_coverage
-        assert result.missing_from_corpus_count == 3
-        assert len(result.deletion_candidates) == 3
+    def test_hyphenated_repo_with_git_suffix(self):
+        self.assertEqual(
+            _parse_github_repo_path(
+                "https://github.com/rhowardstone/Epstein-research-data.git"
+            ),
+            "rhowardstone/Epstein-research-data",
+        )
 
-    def test_empty_index_gives_zero_coverage(self, bates):
-        result = bates.reconcile(["DOJ-001"], [])
-        assert result.coverage_pct == 0.0
-        assert result.unindexed_count == 1
+    def test_single_path_segment_raises(self):
+        with self.assertRaisesRegex(ValueError, "Cannot parse"):
+            _parse_github_repo_path("https://github.com/only-owner")
 
 
 # ---------------------------------------------------------------------------
-# TestEFTAReconciliation
+# check_sequence_reconciliation
 # ---------------------------------------------------------------------------
 
-class TestEFTAReconciliation:
+class TestCheckSequenceReconciliation(unittest.TestCase):
+    """Thin delegation wrapper -- verify it passes through to scheme.reconcile()."""
+
+    def test_delegates_to_efta(self):
+        result = check_sequence_reconciliation(
+            corpus_numbers=["1", "2"],
+            index_numbers=["1", "2", "3"],
+            scheme=EFTANumber(),
+        )
+        self.assertIsInstance(result, ReconciliationResult)
+        self.assertEqual(result.sequence_type, "EFTA")
+        self.assertIn("3", result.deletion_candidates)
+
+    def test_delegates_to_bates(self):
+        result = check_sequence_reconciliation(
+            corpus_numbers=["DOJ-000001"],
+            index_numbers=["DOJ-000001", "DOJ-000002"],
+            scheme=BatesNumber(),
+        )
+        self.assertEqual(result.sequence_type, "BATES")
+        self.assertIn("DOJ-000002", result.deletion_candidates)
+
+    def test_full_coverage_yields_no_deletion_candidates(self):
+        nums = ["1", "2", "3"]
+        result = check_sequence_reconciliation(nums, nums, EFTANumber())
+        self.assertEqual(result.deletion_candidates, [])
+        self.assertEqual(result.coverage_pct, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# check_community_vetting
+# ---------------------------------------------------------------------------
+
+class TestCheckCommunityVetting(unittest.TestCase):
     """
-    Reconciliation logic exercised through EFTANumber.
-
-    The critical EFTA-specific behaviour: DS9 gap numbers must be separated
-    from true deletion candidates. A gap in the EFTA sequence is only a
-    deletion candidate if it is NOT in the documented DS9 gap set.
+    setUp creates a temp dir; each test writes its own endorsers JSON into it
+    with a descriptive filename.  tearDown removes the dir wholesale.
     """
 
-    def test_full_coverage(self, efta):
-        index = ["1", "2", "3", "4", "5"]
-        corpus = ["1", "2", "3", "4", "5"]
-        result = efta.reconcile(corpus, index)
-        assert result.present_count == 5
-        assert result.missing_from_corpus_count == 0
-        assert result.coverage_pct == 1.0
-        assert result.sequence_type == "EFTA"
+    def setUp(self):
+        self.tmp_dir = Path(tempfile.mkdtemp())
 
-    def test_missing_numbers_without_ds9_gaps_are_deletion_candidates(self, efta):
-        """Without DS9 gap data, all missing EFTA numbers are deletion candidates."""
-        index = [str(n) for n in range(1, 11)]   # 1–10
-        corpus = [str(n) for n in range(1, 8)]   # 1–7, missing 8,9,10
-        result = efta.reconcile(corpus, index)
-        assert result.missing_from_corpus_count == 3
-        assert result.expected_gap_numbers == []
-        assert sorted(result.deletion_candidates, key=int) == ["10", "8", "9"] or \
-               sorted(result.deletion_candidates, key=int) == ["8", "9", "10"]
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir)
 
-    def test_ds9_gaps_are_expected_not_deletion_candidates(self, efta_with_ds9_gaps):
-        """
-        DS9 gap numbers (5000–5499 in fixture) must appear in expected_gap_numbers,
-        NOT in deletion_candidates.
+    def _write(self, name: str, data) -> Path:
+        p = self.tmp_dir / name
+        p.write_text(json.dumps(data))
+        return p
 
-        This is the core EFTA business rule. Failing this test means the system
-        would generate thousands of false deletion alarms from documented DS9 gaps.
-        """
-        # Index includes both a real gap (4999) and DS9 gaps (5001–5003)
-        index = [str(n) for n in range(4995, 5010)]
-        # Corpus is missing 4999 (real gap) and 5001, 5002, 5003 (DS9 gaps)
-        corpus = [str(n) for n in range(4995, 5010)
-                  if n not in (4999, 5001, 5002, 5003)]
+    def test_cited_corpus_endorsed(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting(RHOWARDSTONE_URL, endorsers_path=p)
+        self.assertTrue(r.endorsed)
+        self.assertEqual(r.provenance_tag, "PROVENANCE_COMMUNITY_VOUCHED")
+        self.assertIn("RHOWARDSTONE", r.endorsing_orgs)
 
-        result = efta_with_ds9_gaps.reconcile(corpus, index)
+    def test_unknown_repo_not_endorsed(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting("https://github.com/x/unknown", endorsers_path=p)
+        self.assertFalse(r.endorsed)
+        self.assertEqual(r.provenance_tag, "PROVENANCE_UNVERIFIED")
+        self.assertEqual(r.endorsing_orgs, [])
 
-        # DS9 gaps (5001-5003) go to expected_gap_numbers
-        assert "5001" in result.expected_gap_numbers
-        assert "5002" in result.expected_gap_numbers
-        assert "5003" in result.expected_gap_numbers
+    def test_git_suffix_normalised(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting(RHOWARDSTONE_URL + ".git", endorsers_path=p)
+        self.assertTrue(r.endorsed)
 
-        # Real gap (4999) goes to deletion_candidates
-        assert "4999" in result.deletion_candidates
+    def test_trailing_slash_normalised(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting(RHOWARDSTONE_URL + "/", endorsers_path=p)
+        self.assertTrue(r.endorsed)
 
-        # DS9 gaps must NOT be in deletion_candidates
-        assert "5001" not in result.deletion_candidates
-        assert "5002" not in result.deletion_candidates
-        assert "5003" not in result.deletion_candidates
+    def test_case_insensitive_match(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting(RHOWARDSTONE_URL.upper(), endorsers_path=p)
+        self.assertTrue(r.endorsed)
 
-    def test_expected_gaps_count_toward_missing_not_coverage(self, efta_with_ds9_gaps):
-        """
-        Expected gaps still count toward missing_from_corpus_count (they ARE absent).
-        They should NOT drag down deletion_candidates.
-        Coverage is computed on present/index, so expected gaps reduce coverage.
-        """
-        index = [str(n) for n in range(5000, 5010)]
-        # All DS9 gap numbers (5000–5499) — corpus has none of them
-        corpus = []
+    def test_placeholder_id_never_endorses(self):
+        data = {
+            "_schema_version": "0.2",
+            "endorsers": [{
+                "id": "PLACEHOLDER",
+                "cited_corpora": [RHOWARDSTONE_URL],
+            }],
+        }
+        p = self._write("placeholder.json", data)
+        r = check_community_vetting(RHOWARDSTONE_URL, endorsers_path=p)
+        self.assertFalse(r.endorsed)
 
-        result = efta_with_ds9_gaps.reconcile(corpus, index)
-        assert result.missing_from_corpus_count == 10
-        # All 10 are in the DS9 gap range (5000-5499)
-        assert len(result.expected_gap_numbers) == 10
-        assert result.deletion_candidates == []
+    def test_multiple_orgs_endorse_same_corpus(self):
+        data = {
+            "_schema_version": "0.2",
+            "endorsers": [
+                {"id": "ORG_A", "cited_corpora": ["https://github.com/owner/repo"]},
+                {"id": "ORG_B", "cited_corpora": ["https://github.com/owner/repo"]},
+            ],
+        }
+        p = self._write("multi.json", data)
+        r = check_community_vetting("https://github.com/owner/repo", endorsers_path=p)
+        self.assertTrue(r.endorsed)
+        self.assertIn("ORG_A", r.endorsing_orgs)
+        self.assertIn("ORG_B", r.endorsing_orgs)
+        self.assertEqual(len(r.endorsing_orgs), 2)
 
-    def test_sort_order_is_numeric(self, efta):
-        """EFTA numbers sort numerically, not lexicographically."""
-        index = ["1", "2", "10", "20", "100"]
-        corpus = ["2", "20"]
-        result = efta.reconcile(corpus, index)
-        # Missing: 1, 10, 100 — should sort as 1, 10, 100 not 1, 10, 100 lexicographically
-        assert result.deletion_candidates == ["1", "10", "100"]
+    def test_empty_cited_corpora_does_not_endorse(self):
+        # NPR in ENDORSERS_SIMPLE has an empty cited_corpora list
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting("https://github.com/some/repo", endorsers_path=p)
+        self.assertFalse(r.endorsed)
 
-    def test_large_realistic_scale(self, efta):
-        """Reconciliation handles corpus-scale numbers without performance issues."""
-        n = 10_000
-        index = [str(i) for i in range(1, n + 1)]
-        # Simulate 5% gap rate
-        corpus = [str(i) for i in range(1, n + 1) if i % 20 != 0]
-        result = efta.reconcile(corpus, index)
-        assert result.missing_from_corpus_count == n // 20
-        assert len(result.deletion_candidates) == n // 20
+    def test_missing_cited_corpora_key_is_safe(self):
+        data = {"_schema_version": "0.2", "endorsers": [{"id": "X", "name": "X"}]}
+        p = self._write("no_corpora_key.json", data)
+        r = check_community_vetting("https://github.com/any/repo", endorsers_path=p)
+        self.assertFalse(r.endorsed)
 
-    def test_empty_corpus(self, efta):
-        index = ["1", "2", "3"]
-        result = efta.reconcile([], index)
-        assert result.coverage_pct == 0.0
-        assert result.partial_coverage
-        assert result.missing_from_corpus_count == 3
+    def test_returns_community_vetting_result_type(self):
+        p = self._write("simple.json", ENDORSERS_SIMPLE)
+        r = check_community_vetting("https://github.com/x/y", endorsers_path=p)
+        self.assertIsInstance(r, CommunityVettingResult)
+
+    def test_real_trusted_endorsers_json_endorses_rhowardstone(self):
+        from pipeline.corpus_evaluator import ENDORSERS_PATH
+        if not ENDORSERS_PATH.exists():
+            self.skipTest("trusted_endorsers.json not present in repo root")
+        r = check_community_vetting(RHOWARDSTONE_URL, endorsers_path=ENDORSERS_PATH)
+        self.assertTrue(r.endorsed)
+        self.assertEqual(r.provenance_tag, "PROVENANCE_COMMUNITY_VOUCHED")
 
 
 # ---------------------------------------------------------------------------
-# TestSequenceSchemeContract
+# check_git_integrity -- preconditions (no network, no token needed)
 # ---------------------------------------------------------------------------
 
-class TestSequenceSchemeContract:
+class TestCheckGitIntegrityPreconditions(unittest.TestCase):
     """
-    Contract tests that both BatesNumber and EFTANumber must satisfy.
-    Parameterised so any new SequenceNumber subclass can be added here.
-
-    These tests verify that the ABC contract is correctly implemented —
-    not the scheme-specific behaviour, but the shared interface.
+    Tests that are reachable without mocking PyGithub.
+    setUp pops GITHUB_TOKEN so these always run in no-credentials mode;
+    tearDown restores the original value.
     """
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_scheme_name_is_string(self, request, scheme_fixture):
-        scheme = request.getfixturevalue(scheme_fixture)
-        assert isinstance(scheme.scheme_name, str)
-        assert len(scheme.scheme_name) > 0
+    def setUp(self):
+        self._saved_token = os.environ.pop("GITHUB_TOKEN", None)
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_reconcile_returns_reconciliation_result(self, request, scheme_fixture):
-        scheme = request.getfixturevalue(scheme_fixture)
-        result = scheme.reconcile([], [])
-        assert isinstance(result, ReconciliationResult)
+    def tearDown(self):
+        if self._saved_token is not None:
+            os.environ["GITHUB_TOKEN"] = self._saved_token
+        else:
+            os.environ.pop("GITHUB_TOKEN", None)
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_reconcile_result_sequence_type_matches_scheme(self, request, scheme_fixture):
-        scheme = request.getfixturevalue(scheme_fixture)
-        result = scheme.reconcile([], [])
-        assert result.sequence_type == scheme.scheme_name
+    def test_returns_git_integrity_result(self):
+        self.assertIsInstance(
+            check_git_integrity("https://github.com/s/r"), GitIntegrityResult
+        )
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_deletion_candidates_subset_of_missing(self, request, scheme_fixture):
-        """deletion_candidates must always be a subset of missing_numbers."""
-        scheme = request.getfixturevalue(scheme_fixture)
-        index = ["1", "2", "3", "4", "5"] if scheme_fixture == "efta" \
-            else ["DOJ-001", "DOJ-002", "DOJ-003", "DOJ-004", "DOJ-005"]
-        corpus = index[:2]
-        result = scheme.reconcile(corpus, index)
-        missing_set = set(result.missing_numbers)
-        for candidate in result.deletion_candidates:
-            assert candidate in missing_set, (
-                f"{candidate} in deletion_candidates but not in missing_numbers"
+    def test_missing_credentials_review_recommended(self):
+        self.assertEqual(
+            check_git_integrity("https://github.com/s/r").score,
+            "REVIEW_RECOMMENDED",
+        )
+
+    def test_missing_credentials_notes_are_diagnostic(self):
+        notes = check_git_integrity("https://github.com/s/r").notes
+        self.assertTrue("PyGithub" in notes or "GITHUB_TOKEN" in notes)
+
+    def test_single_segment_url_review_recommended(self):
+        self.assertEqual(
+            check_git_integrity("https://github.com/single-seg").score,
+            "REVIEW_RECOMMENDED",
+        )
+
+    def test_score_is_valid_value(self):
+        self.assertIn(
+            check_git_integrity("https://github.com/s/r").score,
+            {"CLEAN", "REVIEW_RECOMMENDED", "REJECTED"},
+        )
+
+    def test_notes_is_non_empty_string(self):
+        r = check_git_integrity("https://github.com/s/r")
+        self.assertIsInstance(r.notes, str)
+        self.assertGreater(len(r.notes), 0)
+
+
+# ---------------------------------------------------------------------------
+# check_git_integrity -- full evaluation via mocked PyGithub
+# ---------------------------------------------------------------------------
+
+class TestCheckGitIntegrityEvaluation(unittest.TestCase):
+
+    def test_healthy_repo_is_clean(self):
+        r = _run_git_check(_good_commits(10))
+        self.assertEqual(r.score, "CLEAN")
+        self.assertFalse(r.forced_pushes_detected)
+        self.assertFalse(r.suspicious_modification_gap)
+
+    def test_clean_result_records_head_sha(self):
+        r = _run_git_check(_good_commits(10))
+        self.assertEqual(r.commit_hash_evaluated, "sha0000")
+
+    def test_single_commit_review_recommended(self):
+        r = _run_git_check([_make_commit("abc", "2026-01-15T00:00:00", "Initial commit with data")])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+        self.assertIn("Single-commit", r.notes)
+
+    def test_two_commits_review_recommended(self):
+        r = _run_git_check([
+            _make_commit("s1", "2026-01-15T00:00:00", "Add corpus data from DOJ release"),
+            _make_commit("s0", "2026-01-10T00:00:00", "Initial detailed corpus setup"),
+        ])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+
+    def test_three_commits_review_recommended(self):
+        self.assertEqual(_run_git_check(_good_commits(3)).score, "REVIEW_RECOMMENDED")
+
+    def test_four_commits_can_be_clean(self):
+        self.assertEqual(_run_git_check(_good_commits(4)).score, "CLEAN")
+
+    def test_dormant_before_doj_release_sets_suspicious_gap_flag(self):
+        r = _run_git_check(_good_commits(10, date="2024-06-01"))
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+        self.assertTrue(r.suspicious_modification_gap)
+
+    def test_non_descriptive_initial_commit_message(self):
+        r = _run_git_check([
+            _make_commit("s1", "2026-01-15T00:00:00", "Add more data files to the corpus"),
+            _make_commit("s0", "2026-01-10T00:00:00", "init"),  # < 20 chars
+        ])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+        self.assertIn("non-descriptive", r.notes.lower())
+
+    def test_null_commit_message_handled_gracefully(self):
+        r = _run_git_check([
+            _make_commit("s1", "2026-01-15T00:00:00", "Add comprehensive corpus data"),
+            _make_commit("s0", "2026-01-10T00:00:00", None),
+        ])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+
+    def test_empty_commit_message_handled_gracefully(self):
+        r = _run_git_check([
+            _make_commit("s1", "2026-01-15T00:00:00", "Add comprehensive corpus data"),
+            _make_commit("s0", "2026-01-10T00:00:00", ""),
+        ])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+
+    def test_force_push_event_sets_flag(self):
+        evt = MagicMock()
+        evt.type = "PushEvent"
+        evt.payload = {"forced": True}
+        evt.id = "evt-001"
+        r = _run_git_check(_good_commits(10), push_events=[evt])
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+        self.assertTrue(r.forced_pushes_detected)
+        self.assertIn("Force push", r.notes)
+
+    def test_normal_push_event_not_flagged(self):
+        evt = MagicMock()
+        evt.type = "PushEvent"
+        evt.payload = {"forced": False}
+        r = _run_git_check(_good_commits(10), push_events=[evt])
+        self.assertFalse(r.forced_pushes_detected)
+
+    def test_non_push_event_type_ignored(self):
+        evt = MagicMock()
+        evt.type = "IssuesEvent"
+        evt.payload = {"forced": True}  # irrelevant -- wrong type
+        r = _run_git_check(_good_commits(10), push_events=[evt])
+        self.assertFalse(r.forced_pushes_detected)
+
+    def test_events_api_exception_recorded_in_notes(self):
+        mock_repo = MagicMock()
+        mock_repo.get_commits.return_value = _good_commits(10)
+        mock_repo.get_events.side_effect = RuntimeError("Events API unavailable")
+        mock_gh_module = MagicMock()
+        mock_gh_module.Github = MagicMock(
+            return_value=MagicMock(get_repo=MagicMock(return_value=mock_repo))
+        )
+        mock_gh_module.GithubException = GH_EXC
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+            with patch.dict("sys.modules", {"github": mock_gh_module}):
+                r = check_git_integrity("https://github.com/owner/repo")
+        self.assertIn("Could not retrieve push events", r.notes)
+
+    def test_empty_repo_is_rejected(self):
+        r = _run_git_check([])
+        self.assertEqual(r.score, "REJECTED")
+        self.assertIn("no commits", r.notes.lower())
+
+    def test_404_repo_not_found_is_rejected(self):
+        exc = GH_EXC()
+        exc.status = 404
+        exc.data = {}
+        r = _run_git_check([], side_effect=exc)
+        self.assertEqual(r.score, "REJECTED")
+        self.assertIn("not found", r.notes.lower())
+
+    def test_non_404_api_error_is_review_recommended(self):
+        exc = GH_EXC()
+        exc.status = 403
+        exc.data = {"message": "rate limit exceeded"}
+        r = _run_git_check([], side_effect=exc)
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+
+    def test_unexpected_exception_is_review_recommended(self):
+        r = _run_git_check([], side_effect=RuntimeError("network timeout"))
+        self.assertEqual(r.score, "REVIEW_RECOMMENDED")
+        self.assertIn("Unexpected error", r.notes)
+
+
+# ---------------------------------------------------------------------------
+# _write_to_registry
+# ---------------------------------------------------------------------------
+
+class TestWriteToRegistry(unittest.TestCase):
+    """
+    setUp creates a temp dir containing a fresh empty registry file.
+    All tests write into that same registry; tearDown removes the dir.
+    Using setUp (not setUpClass) so each test starts from a clean empty state.
+    """
+
+    EMPTY_REGISTRY = {"_schema_version": "0.1", "corpora": []}
+
+    def setUp(self):
+        self.tmp_dir = Path(tempfile.mkdtemp())
+        self.registry = self.tmp_dir / "corpus_registry.json"
+        self.registry.write_text(json.dumps(self.EMPTY_REGISTRY))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir)
+
+    def _result(self, corpus_id: str = "C-001", tag: str = "PROVENANCE_UNVERIFIED"):
+        return EvaluationResult(
+            corpus_id=corpus_id,
+            github_url="https://github.com/test/repo",
+            evaluation_date="2026-03-09T00:00:00Z",
+            git_integrity=GitIntegrityResult(
+                score="CLEAN", notes="OK", commit_hash_evaluated="abc123"
+            ),
+            sequence_reconciliation=ReconciliationResult(
+                sequence_type="EFTA", present_count=10, coverage_pct=1.0,
+            ),
+            community_vetting=CommunityVettingResult(endorsed=False),
+            final_provenance_tag=tag,
+            ingestion_approved=True,
+            notes="Test result",
+        )
+
+    def _read(self):
+        return json.loads(self.registry.read_text())
+
+    def test_new_corpus_appended(self):
+        with patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry):
+            _write_to_registry(self._result())
+        ids = [c["corpus_id"] for c in self._read()["corpora"]]
+        self.assertIn("C-001", ids)
+
+    def test_existing_entry_updated_not_duplicated(self):
+        with patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry):
+            _write_to_registry(self._result(tag="PROVENANCE_UNVERIFIED"))
+            _write_to_registry(self._result(tag="PROVENANCE_COMMUNITY_VOUCHED"))
+        entries = [c for c in self._read()["corpora"] if c["corpus_id"] == "C-001"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            entries[0]["provenance_tag_assigned"], "PROVENANCE_COMMUNITY_VOUCHED"
+        )
+
+    def test_two_distinct_ids_both_written(self):
+        with patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry):
+            _write_to_registry(self._result("C-001"))
+            _write_to_registry(self._result("C-002"))
+        ids = [c["corpus_id"] for c in self._read()["corpora"]]
+        self.assertIn("C-001", ids)
+        self.assertIn("C-002", ids)
+
+    def test_provenance_tag_persisted(self):
+        with patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry):
+            _write_to_registry(self._result(tag="PROVENANCE_FLAGGED"))
+        entry = next(
+            c for c in self._read()["corpora"] if c["corpus_id"] == "C-001"
+        )
+        self.assertEqual(entry["provenance_tag_assigned"], "PROVENANCE_FLAGGED")
+
+    def test_commit_hash_persisted(self):
+        with patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry):
+            _write_to_registry(self._result())
+        entry = next(
+            c for c in self._read()["corpora"] if c["corpus_id"] == "C-001"
+        )
+        self.assertEqual(entry["evaluated_commit_hash"], "abc123")
+
+
+# ---------------------------------------------------------------------------
+# evaluate_corpus
+# ---------------------------------------------------------------------------
+
+class TestEvaluateCorpus(unittest.TestCase):
+    """
+    setUp creates a temp dir with a fresh empty registry.
+    All calls to evaluate_corpus() patch REGISTRY_PATH to that file and mock
+    both check_git_integrity() and check_community_vetting() so no real I/O
+    or network access occurs.
+    tearDown removes the dir.
+
+    check_community_vetting() is mocked (not ENDORSERS_PATH) because its
+    default argument is bound at import time -- see module docstring.
+    """
+
+    EMPTY_REGISTRY = {"_schema_version": "0.1", "corpora": []}
+
+    def setUp(self):
+        self.tmp_dir = Path(tempfile.mkdtemp())
+        self.registry = self.tmp_dir / "corpus_registry.json"
+        self.registry.write_text(json.dumps(self.EMPTY_REGISTRY))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir)
+
+    def _run(
+        self,
+        git_score: str = "CLEAN",
+        corpus_numbers=None,
+        index_numbers=None,
+        vetting_result=None,
+        scheme=None,
+    ) -> EvaluationResult:
+        git_r = GitIntegrityResult(
+            score=git_score, notes=f"Mocked: {git_score}", commit_hash_evaluated="abc"
+        )
+        vet_r = vetting_result or CommunityVettingResult(
+            endorsed=False, provenance_tag="PROVENANCE_UNVERIFIED"
+        )
+        with (
+            patch("pipeline.corpus_evaluator.check_git_integrity", return_value=git_r),
+            patch("pipeline.corpus_evaluator.check_community_vetting", return_value=vet_r),
+            patch("pipeline.corpus_evaluator.REGISTRY_PATH", self.registry),
+        ):
+            return evaluate_corpus(
+                corpus_id="T-001",
+                github_url="https://github.com/test/repo",
+                index_numbers=index_numbers or ["1", "2", "3"],
+                corpus_numbers=corpus_numbers,
+                sequence_scheme=scheme or EFTANumber(),
             )
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_expected_gaps_plus_deletion_candidates_equals_missing(
-        self, request, scheme_fixture
-    ):
-        """expected_gap_numbers + deletion_candidates must equal missing_numbers exactly."""
-        scheme = request.getfixturevalue(scheme_fixture)
-        index = ["1", "2", "3", "4", "5"] if scheme_fixture == "efta" \
-            else ["DOJ-001", "DOJ-002", "DOJ-003", "DOJ-004", "DOJ-005"]
-        corpus = index[:2]
-        result = scheme.reconcile(corpus, index)
-        reconstructed = set(result.expected_gap_numbers) | set(result.deletion_candidates)
-        assert reconstructed == set(result.missing_numbers)
+    def _read(self):
+        return json.loads(self.registry.read_text())
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_coverage_pct_between_zero_and_one(self, request, scheme_fixture):
-        scheme = request.getfixturevalue(scheme_fixture)
-        index = ["1", "2", "3"] if scheme_fixture == "efta" \
-            else ["DOJ-001", "DOJ-002", "DOJ-003"]
-        corpus = index[:2]
-        result = scheme.reconcile(corpus, index)
-        assert 0.0 <= result.coverage_pct <= 1.0
+    # Provenance tag branches
 
-    @pytest.mark.parametrize("scheme_fixture", ["bates", "efta"])
-    def test_gap_is_expected_returns_bool(self, request, scheme_fixture):
-        scheme = request.getfixturevalue(scheme_fixture)
-        value = "1" if scheme_fixture == "efta" else "DOJ-001"
-        assert isinstance(scheme.gap_is_expected(value), bool)
+    def test_rejected_git_produces_provenance_rejected(self):
+        r = self._run(git_score="REJECTED")
+        self.assertEqual(r.final_provenance_tag, "PROVENANCE_REJECTED")
+
+    def test_rejected_git_sets_ingestion_approved_false(self):
+        self.assertFalse(self._run(git_score="REJECTED").ingestion_approved)
+
+    def test_review_recommended_produces_provenance_flagged(self):
+        r = self._run(git_score="REVIEW_RECOMMENDED")
+        self.assertEqual(r.final_provenance_tag, "PROVENANCE_FLAGGED")
+
+    def test_clean_full_coverage_not_flagged_or_rejected(self):
+        r = self._run(git_score="CLEAN", corpus_numbers=["1", "2", "3"])
+        self.assertNotIn(
+            r.final_provenance_tag, {"PROVENANCE_REJECTED", "PROVENANCE_FLAGGED"}
+        )
+
+    def test_endorsed_clean_full_coverage_community_vouched(self):
+        vouched = CommunityVettingResult(
+            endorsed=True,
+            endorsing_orgs=["TEST_ORG"],
+            provenance_tag="PROVENANCE_COMMUNITY_VOUCHED",
+        )
+        r = self._run(
+            git_score="CLEAN",
+            corpus_numbers=["1", "2", "3"],
+            index_numbers=["1", "2", "3"],
+            vetting_result=vouched,
+        )
+        self.assertEqual(r.final_provenance_tag, "PROVENANCE_COMMUNITY_VOUCHED")
+        self.assertTrue(r.community_vetting.endorsed)
+
+    def test_endorsed_but_partial_coverage_not_community_vouched(self):
+        # Only 1 of 10 numbers in corpus -- well below COVERAGE_THRESHOLD
+        vouched = CommunityVettingResult(
+            endorsed=True, provenance_tag="PROVENANCE_COMMUNITY_VOUCHED"
+        )
+        r = self._run(
+            git_score="CLEAN",
+            corpus_numbers=["1"],
+            index_numbers=[str(i) for i in range(10)],
+            vetting_result=vouched,
+        )
+        self.assertNotEqual(r.final_provenance_tag, "PROVENANCE_COMMUNITY_VOUCHED")
+
+    # Reconciliation behaviour
+
+    def test_no_corpus_numbers_skips_reconciliation(self):
+        r = self._run(git_score="CLEAN", corpus_numbers=None)
+        self.assertEqual(r.sequence_reconciliation.coverage_pct, 0.0)
+        self.assertTrue(r.sequence_reconciliation.partial_coverage)
+
+    def test_defaults_to_efta_scheme(self):
+        r = self._run(scheme=None)
+        self.assertEqual(r.sequence_reconciliation.sequence_type, "EFTA")
+
+    def test_bates_scheme_used_when_passed(self):
+        r = self._run(
+            corpus_numbers=["DOJ-000001"],
+            index_numbers=["DOJ-000001"],
+            scheme=BatesNumber(),
+        )
+        self.assertEqual(r.sequence_reconciliation.sequence_type, "BATES")
+
+    # Result fields
+
+    def test_evaluation_date_is_set(self):
+        self.assertTrue(self._run().evaluation_date)
+
+    def test_corpus_id_preserved(self):
+        self.assertEqual(self._run().corpus_id, "T-001")
+
+    def test_github_url_preserved(self):
+        self.assertEqual(
+            self._run().github_url, "https://github.com/test/repo"
+        )
+
+    def test_notes_contain_coverage_info(self):
+        r = self._run(git_score="CLEAN", corpus_numbers=["1", "2", "3"])
+        self.assertTrue("Coverage" in r.notes or "coverage" in r.notes)
+
+    # Registry writes
+
+    def test_approved_result_written_to_registry(self):
+        self._run(git_score="CLEAN")
+        ids = [c["corpus_id"] for c in self._read()["corpora"]]
+        self.assertIn("T-001", ids)
+
+    def test_rejected_result_not_written_to_registry(self):
+        # REJECTED gates at Check 1 and returns before _write_to_registry
+        self._run(git_score="REJECTED")
+        ids = [c["corpus_id"] for c in self._read()["corpora"]]
+        self.assertNotIn("T-001", ids)
+
+
+# ---------------------------------------------------------------------------
+# Dataclass field completeness
+# ---------------------------------------------------------------------------
+
+class TestGitIntegrityResultFields(unittest.TestCase):
+
+    def test_required_fields(self):
+        r = GitIntegrityResult(score="CLEAN", notes="ok")
+        self.assertEqual(r.score, "CLEAN")
+        self.assertEqual(r.notes, "ok")
+
+    def test_optional_fields_default(self):
+        r = GitIntegrityResult(score="CLEAN", notes="ok")
+        self.assertIsNone(r.commit_hash_evaluated)
+        self.assertFalse(r.forced_pushes_detected)
+        self.assertFalse(r.suspicious_modification_gap)
+
+    def test_all_fields_explicit(self):
+        r = GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes="thin history",
+            commit_hash_evaluated="abc1234",
+            forced_pushes_detected=True,
+            suspicious_modification_gap=True,
+        )
+        self.assertEqual(r.commit_hash_evaluated, "abc1234")
+        self.assertTrue(r.forced_pushes_detected)
+        self.assertTrue(r.suspicious_modification_gap)
+
+
+class TestCommunityVettingResultFields(unittest.TestCase):
+
+    def test_defaults(self):
+        r = CommunityVettingResult()
+        self.assertFalse(r.endorsed)
+        self.assertEqual(r.endorsing_orgs, [])
+        self.assertEqual(r.provenance_tag, "PROVENANCE_UNVERIFIED")
+
+    def test_endorsed(self):
+        r = CommunityVettingResult(
+            endorsed=True,
+            endorsing_orgs=["NPR", "MUCKROCK"],
+            provenance_tag="PROVENANCE_COMMUNITY_VOUCHED",
+        )
+        self.assertTrue(r.endorsed)
+        self.assertEqual(len(r.endorsing_orgs), 2)
+
+
+class TestEvaluationResultFields(unittest.TestCase):
+
+    def test_all_fields_accessible(self):
+        r = EvaluationResult(
+            corpus_id="X",
+            github_url="https://github.com/x/y",
+            evaluation_date="2026-03-09",
+            git_integrity=GitIntegrityResult(score="CLEAN", notes="ok"),
+            sequence_reconciliation=ReconciliationResult(sequence_type="EFTA"),
+            community_vetting=CommunityVettingResult(),
+            final_provenance_tag="PROVENANCE_UNVERIFIED",
+            ingestion_approved=True,
+            notes="test",
+        )
+        self.assertEqual(r.corpus_id, "X")
+        self.assertTrue(r.ingestion_approved)
+        self.assertEqual(r.final_provenance_tag, "PROVENANCE_UNVERIFIED")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,32 +85,197 @@ class EvaluationResult:
 # Check 1: Git History Audit
 # ---------------------------------------------------------------------------
 
+def _parse_github_repo_path(github_url: str) -> str:
+    """
+    Extract 'owner/repo' from a GitHub URL.
+
+    Handles:
+      https://github.com/owner/repo
+      https://github.com/owner/repo.git
+      https://github.com/owner/repo/tree/main
+    """
+    # Strip scheme and host
+    path = github_url.replace("https://github.com/", "").replace("http://github.com/", "")
+    # Take first two path segments: owner/repo
+    parts = path.rstrip("/").split("/")
+    if len(parts) < 2:
+        raise ValueError(f"Cannot parse GitHub repo path from URL: {github_url!r}")
+    repo_path = f"{parts[0]}/{parts[1].removesuffix('.git')}"
+    return repo_path
+
+
+# DOJ Epstein file release began December 2025; any meaningful corpus
+# should have been created or last committed after this date.
+_DOJ_RELEASE_DATE = "2025-12-01"
+
+# Minimum commit message length considered "descriptive"
+_MIN_DESCRIPTIVE_MSG_LEN = 20
+
+
 def check_git_integrity(github_url: str) -> GitIntegrityResult:
     """
-    Audit the commit history of a GitHub corpus repository.
+    Audit the commit history of a GitHub corpus repository using PyGithub.
 
-    Flags repositories where:
-    - Initial and most recent commits differ by >GIT_DIFF_THRESHOLD of total bytes
-      with no descriptive commit message
-    - Forced pushes (--force) are detected in history
-    - Modification gap is suspicious relative to DOJ release date (Feb 2025)
+    Evaluation criteria
+    -------------------
+    1. Commit count — a single-commit repo has no auditable history. The
+       rhowardstone corpus has only 2 commits; this is flagged as
+       REVIEW_RECOMMENDED, not REJECTED, unless other signals are present.
 
-    Returns a GitIntegrityResult with score CLEAN, REVIEW_RECOMMENDED, or REJECTED.
+    2. Forced pushes — detected by looking for gaps in commit parent chains.
+       PyGithub does not expose force-push events directly; we use the
+       Events API to look for push events with before/after SHA mismatches.
+       If force pushes are detected: REVIEW_RECOMMENDED.
+
+    3. Commit message quality — commits with very short messages (< 20 chars)
+       and large diffs are suspicious. Empty or single-word messages on the
+       initial commit are flagged.
+
+    4. Dormancy gap relative to DOJ release — a repo created before December
+       2025 with no commits after the DOJ release is suspicious: it may be a
+       pre-existing repo repurposed to host new content without a commit trail.
+       If last commit predates DOJ release: REVIEW_RECOMMENDED.
+
+    5. REJECTED is reserved for: repos with no commits at all, or repos where
+       the head commit SHA cannot be retrieved (tampering or deletion signal).
+
+    Requires GITHUB_TOKEN environment variable. If absent, returns
+    REVIEW_RECOMMENDED with a note rather than raising.
 
     Constitution reference: Hard Limit 6 — REJECTED corpora will not be ingested.
     """
-    # TODO: Implement using PyGithub
-    # Milestone: Layer 1 branch
-    #
-    # Skeleton:
-    #   g = Github(os.environ["GITHUB_TOKEN"])
-    #   repo = g.get_repo(parse_repo_path(github_url))
-    #   commits = list(repo.get_commits())
-    #   ...evaluate commit history...
-    #
-    raise NotImplementedError(
-        "check_git_integrity() not yet implemented. "
-        "See Layer 1 branch for implementation target."
+    try:
+        from github import Github, GithubException
+    except ImportError:
+        return GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes="PyGithub not installed. Cannot perform git integrity audit. "
+                  "Install with: pip install PyGithub",
+        )
+
+    try:
+        repo_path = _parse_github_repo_path(github_url)
+    except ValueError as e:
+        return GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes=f"Could not parse GitHub URL: {e}",
+        )
+
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        return GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes="GITHUB_TOKEN environment variable not set. "
+                  "Cannot perform git integrity audit without authentication. "
+                  "Set GITHUB_TOKEN and re-run.",
+        )
+
+    try:
+        g = Github(github_token)
+        repo = g.get_repo(repo_path)
+        commits = list(repo.get_commits())
+    except GithubException as e:
+        if e.status == 404:
+            return GitIntegrityResult(
+                score="REJECTED",
+                notes=f"Repository not found: {repo_path}. "
+                      "Cannot evaluate a corpus whose repository does not exist.",
+            )
+        return GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes=f"GitHub API error ({e.status}): {e.data}. Manual review required.",
+        )
+    except Exception as e:
+        return GitIntegrityResult(
+            score="REVIEW_RECOMMENDED",
+            notes=f"Unexpected error fetching repository: {e}",
+        )
+
+    if not commits:
+        return GitIntegrityResult(
+            score="REJECTED",
+            notes="Repository has no commits. Cannot audit an empty history.",
+        )
+
+    issues: list[str] = []
+    forced_pushes = False
+    suspicious_gap = False
+
+    head_commit = commits[0]
+    head_sha = head_commit.sha
+    head_date = head_commit.commit.author.date.isoformat()
+
+    # ── 1. Commit count ───────────────────────────────────────────────────
+    commit_count = len(commits)
+    if commit_count == 1:
+        issues.append(
+            f"Single-commit repository — no auditable history. "
+            f"All content was added in one push ({head_sha[:8]})."
+        )
+    elif commit_count <= 3:
+        issues.append(
+            f"Very thin commit history ({commit_count} commits). "
+            "Insufficient trail to verify incremental, auditable development."
+        )
+
+    # ── 2. Commit message quality on initial commit ───────────────────────
+    initial_commit = commits[-1]
+    initial_msg = (initial_commit.commit.message or "").strip()
+    if len(initial_msg) < _MIN_DESCRIPTIVE_MSG_LEN:
+        issues.append(
+            f"Initial commit message is non-descriptive: {initial_msg!r} "
+            f"({len(initial_msg)} chars, threshold {_MIN_DESCRIPTIVE_MSG_LEN})."
+        )
+
+    # ── 3. Dormancy gap relative to DOJ release ───────────────────────────
+    if head_date < _DOJ_RELEASE_DATE:
+        suspicious_gap = True
+        issues.append(
+            f"Most recent commit ({head_date}) predates the DOJ Epstein file "
+            f"release ({_DOJ_RELEASE_DATE}). Repository may have been repurposed "
+            "without a commit trail reflecting the new content."
+        )
+
+    # ── 4. Forced push detection via Events API ───────────────────────────
+    # PyGithub exposes push events. A force push event has 'forced: true'
+    # in its payload. We check up to 100 recent events.
+    try:
+        events = list(repo.get_events())
+        for event in events[:100]:
+            if event.type == "PushEvent":
+                payload = event.payload
+                if isinstance(payload, dict) and payload.get("forced", False):
+                    forced_pushes = True
+                    issues.append(
+                        f"Force push detected in repository events "
+                        f"(event id: {event.id}). History may have been rewritten."
+                    )
+                    break
+    except Exception as e:
+        issues.append(f"Could not retrieve push events for force-push check: {e}")
+
+    # ── 5. Compute score ──────────────────────────────────────────────────
+    if forced_pushes:
+        score = "REVIEW_RECOMMENDED"
+    elif suspicious_gap:
+        score = "REVIEW_RECOMMENDED"
+    elif issues:
+        # Thin history alone is REVIEW_RECOMMENDED, not REJECTED
+        score = "REVIEW_RECOMMENDED"
+    else:
+        score = "CLEAN"
+
+    notes = "; ".join(issues) if issues else (
+        f"Commit history appears clean. {commit_count} commits, "
+        f"head at {head_sha[:8]} ({head_date})."
+    )
+
+    return GitIntegrityResult(
+        score=score,
+        notes=notes,
+        commit_hash_evaluated=head_sha,
+        forced_pushes_detected=forced_pushes,
+        suspicious_modification_gap=suspicious_gap,
     )
 
 
@@ -161,17 +327,51 @@ def check_community_vetting(
     sequence reconciliation. It does not mean SHA-256 hash verification.
     """
     with open(endorsers_path) as f:
-        endorsers_data = json.load(f)  # noqa: F841 — used in TODO below
+        endorsers_data = json.load(f)
 
-    # TODO: Implement endorser lookup
-    # Query GitHub stargazers/citation lists and cross-reference against
-    # the endorser registry. For now, returns UNVERIFIED by default.
-    # Milestone: Layer 1 branch
+    endorsers = endorsers_data.get("endorsers", [])
+
+    # Normalize the github_url for comparison: strip trailing slashes,
+    # .git suffix, and scheme variations so that
+    # "https://github.com/owner/repo" == "https://github.com/owner/repo.git"
+    def _normalize(url: str) -> str:
+        return url.lower().rstrip("/").removesuffix(".git")
+
+    normalized_target = _normalize(github_url)
+    matched_orgs: list[str] = []
+
+    for endorser in endorsers:
+        # Skip placeholder and malformed entries
+        endorser_id = endorser.get("id", "")
+        if not endorser_id or endorser_id == "PLACEHOLDER":
+            continue
+
+        # An endorser qualifies the corpus if:
+        # (a) the corpus URL appears in the endorser's cited_corpora list, OR
+        # (b) the endorser's reference_url is a domain that hosts the corpus
+        #     (e.g. MuckRock hosting a document collection)
+        cited_corpora = endorser.get("cited_corpora", [])
+        for cited_url in cited_corpora:
+            if _normalize(cited_url) == normalized_target:
+                matched_orgs.append(endorser_id)
+                break
+
+    endorsed = len(matched_orgs) > 0
+    provenance_tag = (
+        "PROVENANCE_COMMUNITY_VOUCHED" if endorsed else "PROVENANCE_UNVERIFIED"
+    )
+
+    logger.info(
+        "Community vetting for %s: endorsed=%s, orgs=%s",
+        github_url,
+        endorsed,
+        matched_orgs,
+    )
 
     return CommunityVettingResult(
-        endorsed=False,
-        endorsing_orgs=[],
-        provenance_tag="PROVENANCE_UNVERIFIED",
+        endorsed=endorsed,
+        endorsing_orgs=matched_orgs,
+        provenance_tag=provenance_tag,
     )
 
 
