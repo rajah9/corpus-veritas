@@ -2,7 +2,7 @@
 
 *Ethical Boundaries, Legal Constraints & Safeguards*
 *Epstein Files AI Analysis System — corpus-veritas*
-*Version 0.1 — February 2026*
+*Version 0.2 — March 2026*
 
 ---
 
@@ -52,9 +52,11 @@ For any living individual, the system will only surface inferences that are supp
 
 ### Principle IV: Gaps Are Facts
 
-The absence of a document is information. When this system identifies a gap in the public record — a page missing from the DOJ index, a Bates number sequence that jumps, a cross-referenced exhibit that never appears — it will report that gap as a documented structural finding, not as an accusation.
+The absence of a document is information. When this system identifies a gap in the public record — a page missing from the DOJ index, a sequence that jumps, a cross-referenced exhibit that never appears — it will report that gap as a documented structural finding, not as an accusation.
 
 The gap is a fact. What was in those pages is unknown. These are not equivalent statements, and the system will maintain that distinction.
+
+This principle extends to the distinction between *types* of gap. The DOJ Epstein release uses EFTA per-page numbering. Analysis by rhowardstone identified 692,473 EFTA numbers in Dataset 9 (DS9) whose absence is documented but whose cause is unknown — they may represent withheld documents, unimaged evidence, or unused tracking slots. These are **expected gaps**: their absence is a fact, their cause is not. They are recorded as `expected_gap_numbers` and are not escalated to `deletion_candidates`. Treating a documented unknown as an accusation would violate this principle.
 
 ### Principle V: Every Output Is Accountable
 
@@ -142,7 +144,7 @@ This Constitution may be amended by the project owner. Amendments must be docume
 
 ### Conflicts With the Technical Specification
 
-When [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and this Constitution conflict, this Constitution governs.
+When [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) and this Constitution conflict, this Constitution governs.
 
 ### Red Team Audits
 
