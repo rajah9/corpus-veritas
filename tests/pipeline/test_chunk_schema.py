@@ -18,7 +18,8 @@ import unittest
 
 from pydantic import ValidationError
 
-from pipeline.chunk_schema import ChunkMetadata
+from pipeline.chunk_schema import ChunkMetadata, DocumentType, SequenceScheme
+from pipeline.models import ConfidenceTier, DeletionFlag
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,123 @@ class TestOpenSearchDocument(unittest.TestCase):
         v = [float(i) / 1024 for i in range(1024)]
         doc = _minimal(vector=v).opensearch_document()
         self.assertEqual(doc["vector"], v)
+
+
+
+# ===========================================================================
+# New optional fields (Layer 2 schema extension)
+# ===========================================================================
+
+class TestChunkMetadataNewOptionalFields(unittest.TestCase):
+
+    def test_new_optional_fields_default_to_none(self):
+        chunk = _minimal()
+        self.assertIsNone(chunk.sequence_number)
+        self.assertIsNone(chunk.sequence_scheme)
+        self.assertIsNone(chunk.document_date)
+        self.assertIsNone(chunk.document_type)
+        self.assertIsNone(chunk.confidence_tier)
+        self.assertIsNone(chunk.deletion_flag)
+
+    def test_named_entities_defaults_to_empty_list(self):
+        chunk = _minimal()
+        self.assertEqual(chunk.named_entities, [])
+
+    def test_sequence_number_stored(self):
+        chunk = _minimal(sequence_number="1234567")
+        self.assertEqual(chunk.sequence_number, "1234567")
+
+    def test_sequence_scheme_efta(self):
+        chunk = _minimal(sequence_scheme=SequenceScheme.EFTA)
+        self.assertEqual(chunk.sequence_scheme, SequenceScheme.EFTA)
+
+    def test_sequence_scheme_bates(self):
+        chunk = _minimal(sequence_scheme=SequenceScheme.BATES)
+        self.assertEqual(chunk.sequence_scheme, SequenceScheme.BATES)
+
+    def test_document_date_stored(self):
+        chunk = _minimal(document_date="2005-03-15")
+        self.assertEqual(chunk.document_date, "2005-03-15")
+
+    def test_document_type_fbi_302(self):
+        chunk = _minimal(document_type=DocumentType.FBI_302)
+        self.assertEqual(chunk.document_type, DocumentType.FBI_302)
+
+    def test_document_type_court_filing(self):
+        chunk = _minimal(document_type=DocumentType.COURT_FILING)
+        self.assertEqual(chunk.document_type, DocumentType.COURT_FILING)
+
+    def test_all_document_types_valid(self):
+        for dt in DocumentType:
+            chunk = _minimal(document_type=dt)
+            self.assertEqual(chunk.document_type, dt)
+
+    def test_named_entities_stored(self):
+        entities = [{"text": "John Doe", "type": "PERSON", "confidence": 0.97}]
+        chunk = _minimal(named_entities=entities)
+        self.assertEqual(chunk.named_entities, entities)
+
+    def test_confidence_tier_stored(self):
+        chunk = _minimal(confidence_tier=ConfidenceTier.CORROBORATED)
+        self.assertEqual(chunk.confidence_tier, ConfidenceTier.CORROBORATED)
+
+    def test_all_confidence_tiers_valid(self):
+        for tier in ConfidenceTier:
+            chunk = _minimal(confidence_tier=tier)
+            self.assertEqual(chunk.confidence_tier, tier)
+
+    def test_deletion_flag_stored(self):
+        chunk = _minimal(deletion_flag=DeletionFlag.DELETION_SUSPECTED)
+        self.assertEqual(chunk.deletion_flag, DeletionFlag.DELETION_SUSPECTED)
+
+    def test_all_deletion_flags_valid(self):
+        for flag in DeletionFlag:
+            chunk = _minimal(deletion_flag=flag)
+            self.assertEqual(chunk.deletion_flag, flag)
+
+
+# ===========================================================================
+# opensearch_document() with new fields
+# ===========================================================================
+
+class TestOpenSearchDocumentNewFields(unittest.TestCase):
+
+    def test_new_none_fields_excluded(self):
+        doc = _minimal().opensearch_document()
+        for field in ("sequence_number", "sequence_scheme", "document_date",
+                      "document_type", "confidence_tier", "deletion_flag"):
+            self.assertNotIn(field, doc, f"Field '{field}' should be excluded when None")
+
+    def test_named_entities_empty_list_included(self):
+        """Empty list is not None -- it should always appear."""
+        doc = _minimal().opensearch_document()
+        self.assertIn("named_entities", doc)
+        self.assertEqual(doc["named_entities"], [])
+
+    def test_sequence_number_included_when_set(self):
+        doc = _minimal(sequence_number="9876543").opensearch_document()
+        self.assertEqual(doc["sequence_number"], "9876543")
+
+    def test_sequence_scheme_serialised_as_string(self):
+        doc = _minimal(sequence_scheme=SequenceScheme.EFTA).opensearch_document()
+        self.assertEqual(doc["sequence_scheme"], "EFTA")
+
+    def test_document_type_serialised_as_string(self):
+        doc = _minimal(document_type=DocumentType.FBI_302).opensearch_document()
+        self.assertEqual(doc["document_type"], "FBI_302")
+
+    def test_confidence_tier_serialised_as_string(self):
+        doc = _minimal(confidence_tier=ConfidenceTier.CONFIRMED).opensearch_document()
+        self.assertEqual(doc["confidence_tier"], "CONFIRMED")
+
+    def test_deletion_flag_serialised_as_string(self):
+        doc = _minimal(deletion_flag=DeletionFlag.DELETION_CONFIRMED).opensearch_document()
+        self.assertEqual(doc["deletion_flag"], "DELETION_CONFIRMED")
+
+    def test_named_entities_with_entries_included(self):
+        entities = [{"text": "Jane Doe", "type": "PERSON", "confidence": 0.95}]
+        doc = _minimal(named_entities=entities).opensearch_document()
+        self.assertEqual(doc["named_entities"], entities)
 
 
 if __name__ == "__main__":

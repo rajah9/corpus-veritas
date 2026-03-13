@@ -28,8 +28,9 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from config import ChunkingConfig, EmbeddingConfig
-from pipeline.chunk_schema import ChunkMetadata
+from pipeline.chunk_schema import ChunkMetadata, DocumentType, SequenceScheme
 from pipeline.classifier import ClassificationRecord, DocumentClassification
+from pipeline.models import ConfidenceTier, DeletionFlag
 from pipeline.ingestor import (
     _assert_document_cleared,
     chunk_text,
@@ -379,6 +380,79 @@ class TestIngestDocument(unittest.TestCase):
             self.os_client.index.call_args_list[0].kwargs["index"],
             "custom-index",
         )
+
+
+
+class TestIngestDocumentNewFieldPropagation(unittest.TestCase):
+    """Verify new optional fields are passed through to every chunk."""
+
+    def setUp(self):
+        self.bedrock = _mock_bedrock()
+        self.os_client = _mock_opensearch()
+        self.cfg_embed = EmbeddingConfig()
+        self.cfg_chunk = ChunkingConfig(chunk_size_tokens=10, chunk_overlap_tokens=2)
+
+    def _run(self, **kwargs):
+        return ingest_document(
+            record=_record(),
+            text="word " * 20,
+            bedrock_client=self.bedrock,
+            opensearch_client=self.os_client,
+            embedding_config=self.cfg_embed,
+            chunking_config=self.cfg_chunk,
+            **kwargs,
+        )
+
+    def _first_body(self):
+        return self.os_client.index.call_args_list[0].kwargs["body"]
+
+    def test_sequence_number_propagated(self):
+        self._run(sequence_number="1234567")
+        self.assertEqual(self._first_body().get("sequence_number"), "1234567")
+
+    def test_sequence_scheme_propagated(self):
+        self._run(sequence_scheme=SequenceScheme.EFTA)
+        self.assertEqual(self._first_body().get("sequence_scheme"), "EFTA")
+
+    def test_document_date_propagated(self):
+        self._run(document_date="2005-03-15")
+        self.assertEqual(self._first_body().get("document_date"), "2005-03-15")
+
+    def test_document_type_propagated(self):
+        self._run(document_type=DocumentType.FBI_302)
+        self.assertEqual(self._first_body().get("document_type"), "FBI_302")
+
+    def test_confidence_tier_propagated(self):
+        self._run(confidence_tier=ConfidenceTier.CORROBORATED)
+        self.assertEqual(self._first_body().get("confidence_tier"), "CORROBORATED")
+
+    def test_deletion_flag_propagated(self):
+        self._run(deletion_flag=DeletionFlag.DELETION_SUSPECTED)
+        self.assertEqual(self._first_body().get("deletion_flag"), "DELETION_SUSPECTED")
+
+    def test_named_entities_propagated(self):
+        entities = [{"text": "Jane Doe", "type": "PERSON", "confidence": 0.95}]
+        self._run(named_entities=entities)
+        self.assertEqual(self._first_body().get("named_entities"), entities)
+
+    def test_named_entities_none_becomes_empty_list(self):
+        self._run(named_entities=None)
+        self.assertEqual(self._first_body().get("named_entities"), [])
+
+    def test_new_fields_absent_when_not_supplied(self):
+        self._run()
+        body = self._first_body()
+        for field in ("sequence_number", "sequence_scheme", "document_date",
+                      "document_type", "confidence_tier", "deletion_flag"):
+            self.assertNotIn(field, body, f"Field '{field}' should be absent when not supplied")
+
+    def test_new_fields_propagated_to_all_chunks(self):
+        """All chunks in a multi-chunk document receive the same metadata."""
+        self._run(sequence_number="999", document_type=DocumentType.COURT_FILING)
+        for call in self.os_client.index.call_args_list:
+            body = call.kwargs["body"]
+            self.assertEqual(body.get("sequence_number"), "999")
+            self.assertEqual(body.get("document_type"), "COURT_FILING")
 
 
 if __name__ == "__main__":

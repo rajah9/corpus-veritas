@@ -219,5 +219,43 @@ class TestDeleteIndex(unittest.TestCase):
         self.assertIn("documents", str(ctx.exception))
 
 
+
+class TestBuildIndexMappingNewFields(unittest.TestCase):
+    """Verify seven new fields added in Layer 2 schema extension."""
+
+    def setUp(self):
+        self.props = build_index_mapping()["mappings"]["properties"]
+
+    def test_all_new_fields_present(self):
+        for field in ("sequence_number", "sequence_scheme", "document_date",
+                      "document_type", "named_entities", "confidence_tier",
+                      "deletion_flag"):
+            self.assertIn(field, self.props, f"Field '{field}' missing from mapping")
+
+    def test_sequence_number_is_keyword(self):
+        self.assertEqual(self.props["sequence_number"]["type"], "keyword")
+
+    def test_sequence_scheme_is_keyword(self):
+        self.assertEqual(self.props["sequence_scheme"]["type"], "keyword")
+
+    def test_document_date_is_date(self):
+        self.assertEqual(self.props["document_date"]["type"], "date")
+
+    def test_document_type_is_keyword(self):
+        self.assertEqual(self.props["document_type"]["type"], "keyword")
+
+    def test_named_entities_is_object(self):
+        self.assertEqual(self.props["named_entities"]["type"], "object")
+
+    def test_named_entities_has_dynamic_mapping(self):
+        self.assertTrue(self.props["named_entities"].get("dynamic"))
+
+    def test_confidence_tier_is_keyword(self):
+        self.assertEqual(self.props["confidence_tier"]["type"], "keyword")
+
+    def test_deletion_flag_is_keyword(self):
+        self.assertEqual(self.props["deletion_flag"]["type"], "keyword")
+
+
 if __name__ == "__main__":
     unittest.main()
