@@ -52,9 +52,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import DEFAULT_CHUNKING_CONFIG, DEFAULT_EMBEDDING_CONFIG, ChunkingConfig, EmbeddingConfig
-from pipeline.chunk_schema import ChunkMetadata
+from pipeline.chunk_schema import ChunkMetadata, DocumentType, SequenceScheme
 from pipeline.classifier import ClassificationRecord
-from pipeline.models import DocumentState
+from pipeline.models import ConfidenceTier, DeletionFlag, DocumentState
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +234,14 @@ def ingest_document(
     embedding_config: EmbeddingConfig = DEFAULT_EMBEDDING_CONFIG,
     chunking_config: ChunkingConfig = DEFAULT_CHUNKING_CONFIG,
     index_name: str = OPENSEARCH_INDEX,
+    # Fields that cannot be derived from ClassificationRecord -- caller must supply
+    sequence_number: Optional[str] = None,
+    sequence_scheme: Optional[SequenceScheme] = None,
+    document_date: Optional[str] = None,
+    document_type: Optional[DocumentType] = None,
+    named_entities: Optional[list] = None,
+    confidence_tier: Optional[ConfidenceTier] = None,
+    deletion_flag: Optional[DeletionFlag] = None,
 ) -> list[str]:
     """
     Chunk, embed, and store a cleared document.
@@ -258,6 +266,14 @@ def ingest_document(
     embedding_config  : EmbeddingConfig. Defaults to DEFAULT_EMBEDDING_CONFIG.
     chunking_config   : ChunkingConfig. Defaults to DEFAULT_CHUNKING_CONFIG.
     index_name        : OpenSearch index name.
+    sequence_number   : Extracted EFTA or Bates sequence number string.
+    sequence_scheme   : SequenceScheme identifying the numbering scheme.
+    document_date     : ISO 8601 date of the source document.
+    document_type     : DocumentType enum value.
+    named_entities    : List of NER extraction dicts. Populated by Layer 4;
+                        pass None or [] if not yet available.
+    confidence_tier   : ConfidenceTier for this document's content.
+    deletion_flag     : DeletionFlag if this is a gap/deletion record.
 
     Returns
     -------
@@ -308,6 +324,13 @@ def ingest_document(
             ingestion_date=ingestion_date,
             victim_flag=record.victim_flag,
             corpus_source=record.corpus_source,
+            sequence_number=sequence_number,
+            sequence_scheme=sequence_scheme,
+            document_date=document_date,
+            document_type=document_type,
+            named_entities=named_entities or [],
+            confidence_tier=confidence_tier,
+            deletion_flag=deletion_flag,
         )
 
         index_chunk(chunk, opensearch_client, index_name)

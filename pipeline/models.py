@@ -137,6 +137,53 @@ _FLAG_CONFIDENCE: dict[DeletionFlag, str] = {
 }
 
 
+
+# ---------------------------------------------------------------------------
+# ConfidenceTier
+# ---------------------------------------------------------------------------
+
+class ConfidenceTier(str, Enum):
+    """
+    Evidence strength of a claim, finding, or retrieval result.
+
+    Applied at the chunk level (stored in OpenSearch) and enforced at
+    response time by the guardrail layer (Layer 5). The guardrail ensures
+    that response language matches the tier assigned to the supporting
+    chunks -- CONFIRMED language may only appear for CONFIRMED-tier chunks.
+
+    Tiers in ascending order of evidence strength
+    ---------------------------------------------
+    SPECULATIVE     Possible but evidence is thin or circumstantial. Single
+                    indirect reference, unverified. Requires strong hedging
+                    language in any response that cites it.
+
+    SINGLE_SOURCE   One document only; cannot be independently verified.
+                    May be stated fact within that document but lacks
+                    corroboration.
+
+    INFERRED        Reasonably implied by the evidence but not directly
+                    stated in a primary source. Logical inference grounded
+                    in SINGLE_SOURCE or CORROBORATED material.
+
+    CORROBORATED    Multiple independent documents converge on the same
+                    claim. Independent means different document_uuid values
+                    with different sequence number ranges.
+
+    CONFIRMED       Stated explicitly in a primary source with known
+                    provenance AND independently corroborated. The highest
+                    tier -- requires both direct statement and convergence.
+
+    Architecture reference: docs/ARCHITECTURE.md para Layer 3 -- Confidence
+    Tiers. Guardrail check 3 enforces tier-language consistency.
+    Constitution reference: Principle II -- Confidence Is Mandatory.
+    """
+
+    SPECULATIVE   = "SPECULATIVE"
+    SINGLE_SOURCE = "SINGLE_SOURCE"
+    INFERRED      = "INFERRED"
+    CORROBORATED  = "CORROBORATED"
+    CONFIRMED     = "CONFIRMED"
+
 # ---------------------------------------------------------------------------
 # DocumentState
 # ---------------------------------------------------------------------------
