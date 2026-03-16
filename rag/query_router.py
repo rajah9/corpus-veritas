@@ -74,6 +74,15 @@ from pipeline.ingestor import embed_text
 from pipeline.models import ConfidenceTier
 from config import DEFAULT_EMBEDDING_CONFIG, EmbeddingConfig
 
+# Graph import is optional -- RelationshipGraph requires networkx.
+# Import deferred to avoid hard dependency in environments without it.
+try:
+    from graph.relationship_graph import RelationshipGraph
+    _GRAPH_AVAILABLE = True
+except ImportError:
+    RelationshipGraph = None  # type: ignore[assignment,misc]
+    _GRAPH_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-1")
@@ -550,12 +559,94 @@ def synthesise_answer(
 # Public API
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Graph-backed relationship retrieval
+# ---------------------------------------------------------------------------
+
+def _retrieve_relationship(
+    request: QueryRequest,
+    vector: list[float],
+    relationship_graph,
+    opensearch_client,
+    index_name: str,
+) -> list[dict]:
+    """
+    Attempt graph traversal for a RELATIONSHIP query, fall back to kNN.
+
+    For a two-entity RELATIONSHIP query, builds node_ids from the first
+    two entity_names in request.entity_names, attempts shortest_path on
+    the graph, then retrieves chunks for all documents associated with
+    nodes on the path. Falls back to kNN if no path is found.
+
+    Parameters
+    ----------
+    request            : QueryRequest with entity_names[0] and [1].
+    vector             : Embedded query vector (for kNN fallback).
+    relationship_graph : RelationshipGraph instance.
+    opensearch_client  : OpenSearch client for chunk retrieval.
+    index_name         : OpenSearch index name.
+
+    Returns
+    -------
+    List of chunk dicts from path documents, or kNN fallback chunks.
+    """
+    from graph.entity_resolver import EntityType
+
+    # Build candidate node_ids for the two entity names.
+    # We don't know the EntityType at query time, so try PERSON first
+    # (most common for relationship queries in this corpus), then fall
+    # back to kNN if the path is not found.
+    entity_a = f"PERSON::{request.entity_names[0].strip().lower()}"
+    entity_b = f"PERSON::{request.entity_names[1].strip().lower()}"
+
+    path = relationship_graph.shortest_path(entity_a, entity_b)
+
+    if not path:
+        logger.info(
+            "No graph path found between '%s' and '%s' -- falling back to kNN.",
+            entity_a, entity_b,
+        )
+        dsl = _build_relationship_query(vector, request.top_k, request.entity_names)
+        return retrieve_chunks(dsl, opensearch_client, index_name)
+
+    # Collect all document_uuids from nodes on the path
+    path_doc_uuids: set[str] = set()
+    for node_id in path:
+        entity = relationship_graph.get_entity(node_id)
+        if entity:
+            path_doc_uuids.update(entity.document_uuids)
+
+    if not path_doc_uuids:
+        logger.info("Graph path found but no document_uuids -- falling back to kNN.")
+        dsl = _build_relationship_query(vector, request.top_k, request.entity_names)
+        return retrieve_chunks(dsl, opensearch_client, index_name)
+
+    # Retrieve chunks from documents on the graph path
+    path_dsl = {
+        "size": request.top_k,
+        "query": {
+            "bool": {
+                "must": [{"terms": {"document_uuid": list(path_doc_uuids)}}],
+                "must_not": [_victim_flag_filter()],
+            }
+        },
+    }
+    chunks = retrieve_chunks(path_dsl, opensearch_client, index_name)
+    logger.info(
+        "Graph path %s → %s: %d path documents, %d chunks retrieved.",
+        entity_a, entity_b, len(path_doc_uuids), len(chunks),
+    )
+    return chunks
+
+
 def route_query(
     request: QueryRequest,
     opensearch_client,
     bedrock_client=None,
     embedding_config: EmbeddingConfig = DEFAULT_EMBEDDING_CONFIG,
     index_name: str = OPENSEARCH_INDEX,
+    relationship_graph=None,
 ) -> RetrievalResult:
     """
     Route a query through the full retrieval and synthesis pipeline.
@@ -580,6 +671,11 @@ def route_query(
                         from AWS_REGION. Inject a MagicMock for testing.
     embedding_config  : EmbeddingConfig for query embedding.
     index_name        : OpenSearch index to query.
+    relationship_graph : RelationshipGraph instance for RELATIONSHIP queries.
+                         If provided, graph traversal is attempted first;
+                         kNN retrieval is used as fallback when the graph
+                         has no path between the requested entities.
+                         If None, kNN retrieval is used directly.
 
     Returns
     -------
@@ -610,7 +706,19 @@ def route_query(
     dsl = build_query(request, vector)
 
     # Step 3: retrieve
-    chunks = retrieve_chunks(dsl, opensearch_client, index_name)
+    # For RELATIONSHIP queries, attempt graph traversal first if a graph
+    # is available. Fall back to kNN if the graph has no path.
+    if (
+        request.query_type == QueryType.RELATIONSHIP
+        and relationship_graph is not None
+        and request.entity_names
+        and len(request.entity_names) >= 2
+    ):
+        chunks = _retrieve_relationship(
+            request, vector, relationship_graph, opensearch_client, index_name
+        )
+    else:
+        chunks = retrieve_chunks(dsl, opensearch_client, index_name)
     logger.info("Retrieved %d chunks for query type=%s", len(chunks), request.query_type.value)
 
     # Step 4: determine lowest tier and synthesise
