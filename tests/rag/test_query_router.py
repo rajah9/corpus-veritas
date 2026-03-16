@@ -458,5 +458,73 @@ class TestRouteQuery(unittest.TestCase):
         self.os_client.search.assert_called_once()
 
 
+
+# ===========================================================================
+# route_query -- graph-backed RELATIONSHIP queries
+# ===========================================================================
+
+class TestRouteQueryGraphRelationship(unittest.TestCase):
+    """Verify graph-first retrieval for RELATIONSHIP queries."""
+
+    def _mock_graph(self, path=None, entity_uuids=None):
+        from graph.entity_resolver import Entity, EntityType
+        graph = MagicMock()
+        graph.shortest_path.return_value = path
+        if path and entity_uuids is not None:
+            entity = MagicMock()
+            entity.document_uuids = entity_uuids
+            graph.get_entity.return_value = entity
+        else:
+            graph.get_entity.return_value = None
+        return graph
+
+    def _run(self, entity_names=None, graph=None, chunks=None):
+        if chunks is None:
+            chunks = [{"document_uuid": "uuid-001", "text": "chunk"}]
+        bedrock = _mock_bedrock_full()
+        os_client = _mock_opensearch(chunks)
+        return route_query(
+            request=QueryRequest(
+                query_text="Who connects Alice to Bob?",
+                query_type=QueryType.RELATIONSHIP,
+                entity_names=entity_names or ["alice", "bob"],
+            ),
+            opensearch_client=os_client,
+            bedrock_client=bedrock,
+            relationship_graph=graph,
+        ), os_client
+
+    def test_no_graph_falls_back_to_knn(self):
+        result, os_client = self._run(graph=None)
+        self.assertIsInstance(result, RetrievalResult)
+        os_client.search.assert_called_once()
+
+    def test_graph_path_found_uses_document_uuid_query(self):
+        path = ["PERSON::alice", "PERSON::bob"]
+        graph = self._mock_graph(path=path, entity_uuids=["uuid-path-001"])
+        result, os_client = self._run(graph=graph)
+        # search should be called (once for graph-path doc retrieval)
+        os_client.search.assert_called_once()
+
+    def test_graph_no_path_falls_back_to_knn(self):
+        graph = self._mock_graph(path=None)
+        result, os_client = self._run(graph=graph)
+        os_client.search.assert_called_once()
+
+    def test_fewer_than_two_entity_names_skips_graph(self):
+        graph = self._mock_graph(path=["PERSON::alice", "PERSON::bob"])
+        result, os_client = self._run(entity_names=["alice"], graph=graph)
+        # Graph shortest_path should NOT be called with only one entity
+        graph.shortest_path.assert_not_called()
+
+    def test_returns_retrieval_result(self):
+        result, _ = self._run(graph=None)
+        self.assertIsInstance(result, RetrievalResult)
+
+    def test_relationship_convergence_applied_true(self):
+        result, _ = self._run(graph=None)
+        self.assertTrue(result.convergence_applied)
+
+
 if __name__ == "__main__":
     unittest.main()
