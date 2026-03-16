@@ -47,7 +47,26 @@ Check 3 -- Confidence calibration check
 
     Constitution Hard Limit 3. Principle II.
 
-Check 4 -- Audit log write
+Check 4 -- Creative content check (Hard Limit 4, best-effort lexical)
+    Scans the response for fictional-scenario and speculative-hypothetical
+    language markers ("imagine if", "hypothetically", "what if", "suppose
+    that", "in a scenario where", "let's say", "if we assume", etc.).
+    Because Hard Limit 4 prohibits generating creative or speculative
+    content about real named individuals, any response containing these
+    markers is suppressed entirely (replaced with a standard message)
+    rather than corrected. Suppression is the right default: creative
+    framing about real individuals in a legal corpus is never acceptable
+    regardless of whether the surrounding content is factual.
+
+    This is a best-effort lexical check. Subtle creative framing that
+    avoids the marker vocabulary will not be caught here -- the synthesis
+    prompt instruction (query_router.py) is the primary defence for those
+    cases. This check catches the obvious cases where the model explicitly
+    frames its response as hypothetical or speculative.
+
+    Constitution Hard Limit 4.
+
+Check 5 -- Audit log write
     Writes an AuditLogEntry to both CloudWatch Logs and S3 BEFORE
     returning GuardrailResult. If write_audit_log() raises AuditLogFailure,
     apply_guardrail() propagates it immediately. The caller must not
@@ -68,7 +87,7 @@ this with any victim_flag=True entities retrieved from DynamoDB
 (ner_extractor.query_entities_by_type or gsi-victim-flag) for the most
 complete coverage.
 
-See CONSTITUTION.md Article III Hard Limits 1, 2, 3, 5.
+See CONSTITUTION.md Article III Hard Limits 1, 2, 3, 4, 5.
 See CONSTITUTION.md Principles II, III, V.
 See docs/ARCHITECTURE.md para Layer 5 -- Ethical Guardrail Layer.
 """
@@ -158,6 +177,11 @@ class GuardrailResult:
                         True if CONFIRMED-tier language was found and
                         corrected in a sub-CONFIRMED response.
 
+    creative_content_suppressed
+                        True if the HL4 lexical check found and suppressed
+                        fictional-scenario or hypothetical language.
+                        Constitution Hard Limit 4.
+
     checks_passed       List of check names that passed without triggering.
     checks_failed       List of check names that triggered and modified
                         the answer.
@@ -167,9 +191,10 @@ class GuardrailResult:
     audit_entry_id:        str
     victim_scan_triggered: bool = False
     inference_downgraded:  bool = False
-    confidence_violation:  bool = False
-    checks_passed:         list[str] = field(default_factory=list)
-    checks_failed:         list[str] = field(default_factory=list)
+    confidence_violation:        bool = False
+    creative_content_suppressed: bool = False
+    checks_passed:               list[str] = field(default_factory=list)
+    checks_failed:               list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +355,86 @@ def check_confidence_calibration(
 
 
 # ---------------------------------------------------------------------------
+# Check 4: creative content (Hard Limit 4, best-effort lexical)
+# ---------------------------------------------------------------------------
+
+# Fictional-scenario and speculative-hypothetical language markers.
+# Presence of any of these in a response about real named individuals is
+# grounds for suppression. Ordered longest-first so specific phrases match
+# before substrings.
+_CREATIVE_CONTENT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\bimagine\s+(?:if|that|for\s+a\s+moment)\b", re.IGNORECASE),
+    re.compile(r"\bin\s+a\s+(?:hypothetical\s+)?scenario\s+where\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+if\s+(?:we\s+)?(?:assumed?|imagined?|supposed?)\b", re.IGNORECASE),
+    re.compile(r"\bsuppose\s+(?:that\s+)?(?:for\s+a\s+moment\s+)?(?:we\s+)?(?:imagined?|assumed?)\b", re.IGNORECASE),
+    re.compile(r"\bsuppose\s+that\b", re.IGNORECASE),
+    re.compile(r"\bif\s+we\s+(?:were\s+to\s+)?assume\b", re.IGNORECASE),
+    re.compile(r"\blet(?:'s|\s+us)\s+(?:imagine|assume|say|suppose|consider)\b", re.IGNORECASE),
+    re.compile(r"\bhypothetically\b", re.IGNORECASE),
+    re.compile(r"\bfor\s+(?:the\s+sake\s+of\s+)?(?:argument|illustration|example)\s*,?\s*(?:let(?:'s|\s+us)\s+)?(?:imagine|assume|say|suppose)\b", re.IGNORECASE),
+    re.compile(r"\bin\s+a\s+(?:fictional|hypothetical|made[- ]up)\s+(?:scenario|account|version|narrative)\b", re.IGNORECASE),
+    re.compile(r"\bcould\s+have\s+(?:potentially\s+)?(?:said|done|written|arranged|planned|intended)\b", re.IGNORECASE),
+    re.compile(r"\bmight\s+have\s+(?:secretly\s+)?(?:planned|intended|arranged|conspired)\b", re.IGNORECASE),
+    re.compile(r"\bspeculat(?:e|ing|ion)\s+(?:that\s+)?(?:perhaps\s+)?(?:he|she|they|it)\b", re.IGNORECASE),
+]
+
+_HL4_SUPPRESSION_MESSAGE: str = (
+    "This response has been suppressed. The system detected language "
+    "that may constitute speculative, hypothetical, or creative content "
+    "about real named individuals, which is prohibited by Hard Limit 4 "
+    "of the corpus-veritas Constitution. The retrieved documents are "
+    "available for direct quotation and factual summary. Please rephrase "
+    "your query to request factual analysis only."
+)
+
+
+def check_creative_content(answer: str) -> tuple[str, bool]:
+    """
+    Scan for fictional-scenario and speculative-hypothetical language.
+
+    Best-effort lexical check for Hard Limit 4: the system will never
+    generate creative, speculative, or hypothetical content about real
+    named individuals.
+
+    Unlike Check 3 (confidence calibration), this check suppresses the
+    answer entirely rather than correcting language. Creative framing
+    about real individuals in a legal corpus is never acceptable --
+    there is no hedged equivalent that makes a hypothetical scenario
+    about a real person appropriate.
+
+    Patterns checked include: "imagine if", "hypothetically", "suppose
+    that", "let's assume", "in a scenario where", "could have planned",
+    "might have secretly intended", and similar markers. See
+    _CREATIVE_CONTENT_PATTERNS for the full list.
+
+    Limitation: this is a lexical check and will not catch subtle
+    creative framing that avoids the marker vocabulary. The synthesis
+    prompt instruction in query_router.py is the primary defence for
+    those cases.
+
+    Parameters
+    ----------
+    answer : Response text to scan (after Checks 1-3).
+
+    Returns
+    -------
+    (safe_answer, suppressed) where suppressed is True if the answer
+    was replaced with the suppression message.
+
+    Constitution Hard Limit 4.
+    """
+    for pattern in _CREATIVE_CONTENT_PATTERNS:
+        if pattern.search(answer):
+            logger.warning(
+                "HL4 creative content check: pattern '%s' matched -- "
+                "response suppressed.", pattern.pattern,
+            )
+            return _HL4_SUPPRESSION_MESSAGE, True
+    return answer, False
+
+
+
+# ---------------------------------------------------------------------------
 # Primary entry point
 # ---------------------------------------------------------------------------
 
@@ -411,6 +516,13 @@ def apply_guardrail(
     else:
         checks_passed.append("confidence_calibration")
 
+    # Check 4: creative content (Hard Limit 4, best-effort lexical)
+    safe_answer, creative_suppressed = check_creative_content(safe_answer)
+    if creative_suppressed:
+        checks_failed.append("creative_content")
+    else:
+        checks_passed.append("creative_content")
+
     # Build audit entry
     chunk_uuids = list({
         c.get("document_uuid", "") for c in result.chunks
@@ -438,6 +550,7 @@ def apply_guardrail(
         victim_scan_triggered=victim_triggered,
         inference_downgraded=inference_downgraded,
         confidence_violation=confidence_violated,
+        creative_content_suppressed=creative_suppressed,
         convergence_source_count=(
             convergence_result.independent_source_count
             if convergence_result is not None else None
@@ -456,9 +569,9 @@ def apply_guardrail(
 
     logger.info(
         "Guardrail passed entry_id=%s victim=%s inference_downgraded=%s "
-        "confidence_violation=%s",
+        "confidence_violation=%s creative_suppressed=%s",
         entry.entry_id, victim_triggered, inference_downgraded,
-        confidence_violated,
+        confidence_violated, creative_suppressed,
     )
 
     return GuardrailResult(
@@ -468,6 +581,7 @@ def apply_guardrail(
         victim_scan_triggered=victim_triggered,
         inference_downgraded=inference_downgraded,
         confidence_violation=confidence_violated,
+        creative_content_suppressed=creative_suppressed,
         checks_passed=checks_passed,
         checks_failed=checks_failed,
     )

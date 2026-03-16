@@ -44,6 +44,7 @@ from rag.guardrail import (
     GuardrailResult,
     apply_guardrail,
     check_confidence_calibration,
+    check_creative_content,
     check_inference_threshold,
     check_victim_identity,
 )
@@ -382,6 +383,121 @@ class TestApplyGuardrail(unittest.TestCase):
         )
         self.assertTrue(gr.victim_scan_triggered)
         self.assertTrue(gr.inference_downgraded)
+
+
+
+# ===========================================================================
+# check_creative_content
+# ===========================================================================
+
+class TestCheckCreativeContent(unittest.TestCase):
+
+    def test_clean_answer_not_suppressed(self):
+        text = "The documents show Epstein met Maxwell on several occasions."
+        safe, suppressed = check_creative_content(text)
+        self.assertEqual(safe, text)
+        self.assertFalse(suppressed)
+
+    def test_imagine_if_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "Imagine if Epstein had planned a different arrangement..."
+        )
+        self.assertTrue(suppressed)
+
+    def test_hypothetically_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "Hypothetically, if Maxwell had not been involved..."
+        )
+        self.assertTrue(suppressed)
+
+    def test_suppose_that_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "Suppose that the parties had agreed to meet elsewhere."
+        )
+        self.assertTrue(suppressed)
+
+    def test_lets_assume_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "Let's assume for a moment that the documents are incomplete."
+        )
+        self.assertTrue(suppressed)
+
+    def test_in_a_scenario_where_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "In a scenario where these meetings had not occurred..."
+        )
+        self.assertTrue(suppressed)
+
+    def test_what_if_assumed_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "What if we assumed the flight logs were falsified?"
+        )
+        self.assertTrue(suppressed)
+
+    def test_might_have_secretly_planned_triggers_suppression(self):
+        _, suppressed = check_creative_content(
+            "He might have secretly planned the arrangement in advance."
+        )
+        self.assertTrue(suppressed)
+
+    def test_suppressed_answer_is_standard_message(self):
+        safe, suppressed = check_creative_content(
+            "Imagine if Epstein had arranged things differently."
+        )
+        self.assertTrue(suppressed)
+        self.assertIn("Hard Limit 4", safe)
+        self.assertIn("suppressed", safe)
+
+    def test_empty_string_not_suppressed(self):
+        safe, suppressed = check_creative_content("")
+        self.assertFalse(suppressed)
+        self.assertEqual(safe, "")
+
+    def test_case_insensitive(self):
+        _, suppressed = check_creative_content(
+            "HYPOTHETICALLY SPEAKING, if we assumed..."
+        )
+        self.assertTrue(suppressed)
+
+
+# ===========================================================================
+# apply_guardrail -- HL4 integration
+# ===========================================================================
+
+class TestApplyGuardrailHL4(unittest.TestCase):
+
+    def _run(self, answer, **kwargs):
+        result = _result(answer=answer, lowest_tier=ConfidenceTier.CORROBORATED)
+        with _mock_audit():
+            return apply_guardrail(result, audit_bucket="audit-bucket", **kwargs)
+
+    def test_clean_answer_passes_hl4(self):
+        gr = self._run("The documents confirm multiple meetings.")
+        self.assertFalse(gr.creative_content_suppressed)
+        self.assertIn("creative_content", gr.checks_passed)
+
+    def test_creative_content_suppressed_flag_set(self):
+        gr = self._run("Hypothetically, if Maxwell had orchestrated this...")
+        self.assertTrue(gr.creative_content_suppressed)
+        self.assertIn("creative_content", gr.checks_failed)
+
+    def test_safe_answer_replaced_with_suppression_message(self):
+        gr = self._run("Imagine if Epstein had planned this differently.")
+        self.assertIn("Hard Limit 4", gr.safe_answer)
+        self.assertNotIn("Imagine if", gr.safe_answer)
+
+    def test_original_answer_preserved_despite_suppression(self):
+        original = "Imagine if Epstein had planned this differently."
+        gr = self._run(original)
+        self.assertEqual(gr.original_answer, original)
+
+    def test_all_four_content_checks_in_checks_list(self):
+        gr = self._run("The documents indicate connections.")
+        all_checks = gr.checks_passed + gr.checks_failed
+        self.assertIn("victim_identity", all_checks)
+        self.assertIn("inference_threshold", all_checks)
+        self.assertIn("confidence_calibration", all_checks)
+        self.assertIn("creative_content", all_checks)
 
 
 if __name__ == "__main__":

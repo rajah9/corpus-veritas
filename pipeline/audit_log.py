@@ -119,6 +119,12 @@ class AuditLogEntry:
     confidence_violation
                         True if the confidence calibration check found and
                         corrected CONFIRMED-tier language.
+
+    creative_content_suppressed
+                        True if the HL4 lexical check found fictional-scenario
+                        or speculative-hypothetical language about real
+                        individuals and suppressed the response.
+                        Constitution Hard Limit 4.
     convergence_source_count
                         Number of independent sources from ConvergenceResult,
                         if available. None if convergence was not checked.
@@ -139,8 +145,9 @@ class AuditLogEntry:
     safe_answer:             str = ""
     victim_scan_triggered:   bool = False
     inference_downgraded:    bool = False
-    confidence_violation:    bool = False
-    convergence_source_count: Optional[int] = None
+    confidence_violation:         bool = False
+    creative_content_suppressed:  bool = False
+    convergence_source_count:     Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -157,8 +164,9 @@ class AuditLogEntry:
             "safe_answer":             self.safe_answer,
             "victim_scan_triggered":   self.victim_scan_triggered,
             "inference_downgraded":    self.inference_downgraded,
-            "confidence_violation":    self.confidence_violation,
-            "convergence_source_count": self.convergence_source_count,
+            "confidence_violation":         self.confidence_violation,
+            "creative_content_suppressed":  self.creative_content_suppressed,
+            "convergence_source_count":     self.convergence_source_count,
         }
 
 

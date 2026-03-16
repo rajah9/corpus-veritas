@@ -332,5 +332,26 @@ class TestWriteAuditLog(unittest.TestCase):
         self.assertIn("Hard Limit 5", str(ctx.exception))
 
 
+
+class TestAuditLogEntryCreativeFlag(unittest.TestCase):
+
+    def test_creative_content_suppressed_defaults_false(self):
+        entry = AuditLogEntry()
+        self.assertFalse(entry.creative_content_suppressed)
+
+    def test_creative_content_suppressed_in_to_dict(self):
+        entry = _entry()
+        entry.creative_content_suppressed = True
+        d = entry.to_dict()
+        self.assertIn("creative_content_suppressed", d)
+        self.assertTrue(d["creative_content_suppressed"])
+
+    def test_creative_content_suppressed_false_in_to_dict(self):
+        entry = _entry()
+        d = entry.to_dict()
+        self.assertIn("creative_content_suppressed", d)
+        self.assertFalse(d["creative_content_suppressed"])
+
+
 if __name__ == "__main__":
     unittest.main()
