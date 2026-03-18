@@ -34,11 +34,15 @@ from pipeline.deletion_pipeline import (
     DELETIONS_TABLE,
     DOCUMENTS_TABLE,
     DeletionPipelineResult,
+    FBI302SeriesDescriptor,
     _flag_document_record,
     _signals_for_candidate,
     _write_deletion_record,
+    _write_withholding_record,
+    run_302_series_checks,
     run_deletion_pipeline,
 )
+from pipeline.models import WithholdingRecord
 from pipeline.manifest_loader import ManifestLoadResult, ManifestRecord
 from pipeline.models import DeletionFlag
 from pipeline.sequence_numbers import EFTANumber, ReconciliationResult
@@ -299,6 +303,196 @@ class TestRunDeletionPipeline(unittest.TestCase):
     def test_manifest_version_stored(self):
         result, _ = self._run()
         self.assertEqual(result.manifest_version, "v1")
+
+
+
+# ===========================================================================
+# _write_withholding_record
+# ===========================================================================
+
+class TestWriteWithholdingRecord(unittest.TestCase):
+
+    def _record(self) -> WithholdingRecord:
+        import uuid as _uuid
+        return WithholdingRecord(
+            record_id=str(_uuid.uuid4()),
+            document_identifiers=["302-TRUMP-001", "302-TRUMP-002"],
+            deletion_flag=DeletionFlag.WITHHELD_SELECTIVELY,
+            acknowledgment_source="WSJ March 2026",
+            acknowledgment_date="2026-03-01",
+            sibling_document_ids=["302-EPSTEIN-CONDUCT"],
+        )
+
+    def test_put_item_called(self):
+        db = _mock_db()
+        _write_withholding_record(self._record(), db)
+        db.put_item.assert_called_once()
+
+    def test_correct_table_used(self):
+        db = _mock_db()
+        _write_withholding_record(self._record(), db)
+        self.assertEqual(db.put_item.call_args.kwargs["TableName"], DELETIONS_TABLE)
+
+    def test_record_id_in_item(self):
+        db = _mock_db()
+        record = self._record()
+        _write_withholding_record(record, db)
+        item = db.put_item.call_args.kwargs["Item"]
+        self.assertEqual(item["record_id"]["S"], record.record_id)
+
+    def test_is_government_acknowledged_set_true(self):
+        db = _mock_db()
+        _write_withholding_record(self._record(), db)
+        item = db.put_item.call_args.kwargs["Item"]
+        self.assertTrue(item["is_government_acknowledged"]["BOOL"])
+
+    def test_sibling_ids_written_when_present(self):
+        db = _mock_db()
+        _write_withholding_record(self._record(), db)
+        item = db.put_item.call_args.kwargs["Item"]
+        self.assertIn("sibling_document_ids", item)
+
+
+# ===========================================================================
+# run_302_series_checks
+# ===========================================================================
+
+class TestRun302SeriesChecks(unittest.TestCase):
+
+    def _descriptor(
+        self,
+        all_ids: list,
+        released_ids: list,
+        series_id: str = "SERIES-001",
+    ) -> FBI302SeriesDescriptor:
+        return FBI302SeriesDescriptor(
+            series_identifier=series_id,
+            all_series_ids=all_ids,
+            released_ids=released_ids,
+            acknowledgment_source="Test source",
+            acknowledgment_date="2026-03-16",
+        )
+
+    def test_fully_released_produces_no_record(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B"], ["A", "B"])]
+        records, errors = run_302_series_checks(descriptors, db)
+        self.assertEqual(records, [])
+        self.assertEqual(errors, [])
+        db.put_item.assert_not_called()
+
+    def test_selective_release_produces_withholding_record(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B", "C"], ["A"])]
+        records, errors = run_302_series_checks(descriptors, db)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(errors, [])
+
+    def test_selective_flag_is_withheld_selectively(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B", "C"], ["A"])]
+        records, _ = run_302_series_checks(descriptors, db)
+        self.assertEqual(records[0].deletion_flag, DeletionFlag.WITHHELD_SELECTIVELY)
+
+    def test_fully_withheld_flag_is_withheld_acknowledged(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B", "C"], [])]
+        records, _ = run_302_series_checks(descriptors, db)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].deletion_flag, DeletionFlag.WITHHELD_ACKNOWLEDGED)
+
+    def test_put_item_called_for_withheld(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B", "C"], ["A"])]
+        run_302_series_checks(descriptors, db)
+        db.put_item.assert_called_once()
+
+    def test_multiple_series_processed(self):
+        db = _mock_db()
+        descriptors = [
+            self._descriptor(["A", "B"], ["A"], "S1"),
+            self._descriptor(["C", "D"], ["C"], "S2"),
+        ]
+        records, errors = run_302_series_checks(descriptors, db)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(db.put_item.call_count, 2)
+
+    def test_dynamo_failure_adds_to_errors(self):
+        db = _mock_db()
+        db.put_item.side_effect = RuntimeError("DynamoDB down")
+        descriptors = [self._descriptor(["A", "B"], ["A"])]
+        records, errors = run_302_series_checks(descriptors, db)
+        self.assertEqual(records, [])
+        self.assertGreater(len(errors), 0)
+
+    def test_sibling_ids_set_on_selective_record(self):
+        db = _mock_db()
+        descriptors = [self._descriptor(["A", "B", "C"], ["A"])]
+        records, _ = run_302_series_checks(descriptors, db)
+        self.assertIn("A", records[0].sibling_document_ids)
+
+
+# ===========================================================================
+# run_deletion_pipeline -- 302 series integration
+# ===========================================================================
+
+class TestRunDeletionPipeline302Integration(unittest.TestCase):
+
+    def _descriptor(self, all_ids, released_ids) -> FBI302SeriesDescriptor:
+        return FBI302SeriesDescriptor(
+            series_identifier="TEST-SERIES",
+            all_series_ids=all_ids,
+            released_ids=released_ids,
+            acknowledgment_source="Test",
+            acknowledgment_date="2026-03-16",
+        )
+
+    def _run_with_302(self, all_ids, released_ids):
+        manifest = _manifest("v1", ["9000000"])
+        efta = _mock_efta([])
+        return run_deletion_pipeline(
+            manifest=manifest,
+            efta_scheme=efta,
+            dynamodb_client=_mock_db(),
+            fbi_302_series=[self._descriptor(all_ids, released_ids)],
+            generate_report=False,
+        )
+
+    def test_withholding_records_populated(self):
+        result = self._run_with_302(["A", "B", "C"], ["A"])
+        self.assertEqual(len(result.withholding_records), 1)
+
+    def test_withholding_records_empty_when_no_series_supplied(self):
+        manifest = _manifest("v1", ["9000000"])
+        efta = _mock_efta([])
+        result = run_deletion_pipeline(
+            manifest=manifest,
+            efta_scheme=efta,
+            dynamodb_client=_mock_db(),
+            generate_report=False,
+        )
+        self.assertEqual(result.withholding_records, [])
+
+    def test_fully_released_series_produces_no_withholding(self):
+        result = self._run_with_302(["A", "B"], ["A", "B"])
+        self.assertEqual(result.withholding_records, [])
+
+    def test_records_written_includes_302_withholdings(self):
+        result = self._run_with_302(["A", "B", "C"], ["A"])
+        self.assertGreater(result.records_written, 0)
+
+    def test_gap_report_includes_withholding_records(self):
+        manifest = _manifest("v1", ["9000000"])
+        efta = _mock_efta([])
+        result = run_deletion_pipeline(
+            manifest=manifest,
+            efta_scheme=efta,
+            dynamodb_client=_mock_db(),
+            fbi_302_series=[self._descriptor(["A", "B", "C"], ["A"])],
+            generate_report=True,
+        )
+        self.assertIsNotNone(result.gap_report)
+        self.assertGreater(result.gap_report.total_gaps, 0)
 
 
 if __name__ == "__main__":

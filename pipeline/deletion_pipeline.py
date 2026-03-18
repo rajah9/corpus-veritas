@@ -48,11 +48,14 @@ from typing import Optional
 from pipeline.deletion_detector import (
     DetectionSignals,
     DeletionRecord,
+    FBI302SeriesResult,
+    check_302_series,
+    create_acknowledged_withholding,
     create_deletion_finding,
 )
 from pipeline.gap_reporter import GapReport, generate_comparison_report, generate_gap_report
 from pipeline.manifest_loader import ManifestLoadResult, load_manifest_from_csv
-from pipeline.models import DeletionFlag, DocumentState
+from pipeline.models import DeletionFlag, DocumentState, WithholdingRecord
 from pipeline.sequence_numbers import EFTANumber, ReconciliationResult
 from pipeline.version_comparator import ComparisonResult, compare_manifests
 
@@ -68,6 +71,37 @@ DOCUMENTS_TABLE: str = "corpus_veritas_documents"
 # ---------------------------------------------------------------------------
 
 @dataclass
+class FBI302SeriesDescriptor:
+    """
+    Descriptor for one FBI 302 interview series to check for partial delivery.
+
+    Pass a list of these to run_deletion_pipeline() via the fbi_302_series
+    parameter. Each descriptor maps to one check_302_series() call.
+
+    Fields
+    ------
+    series_identifier   Human-readable identifier for the series
+                        e.g. "FBI-302-TRUMP-ALLEGATIONS-2019".
+    all_series_ids      All document IDs in the series (released + withheld).
+    released_ids        Document IDs confirmed present in the corpus.
+    total_expected      Total number of 302s expected in the series, if known.
+    acknowledgment_source
+                        Provenance string for the WithholdingRecord.
+    acknowledgment_date ISO 8601 date the series pattern was identified.
+    subject_entities    Named entities (persons) the series concerns.
+    notes               Free-text annotation.
+    """
+    series_identifier:    str
+    all_series_ids:       list[str]
+    released_ids:         list[str]
+    total_expected:       Optional[int] = None
+    acknowledgment_source: str = "FBI 302 series analysis"
+    acknowledgment_date:  str = ""
+    subject_entities:     list[dict] = field(default_factory=list)
+    notes:                Optional[str] = None
+
+
+@dataclass
 class DeletionPipelineResult:
     """
     Result of one deletion pipeline run.
@@ -77,20 +111,22 @@ class DeletionPipelineResult:
     manifest_version        Version label of the manifest processed.
     reconciliation          ReconciliationResult from EFTANumber.reconcile().
     deletion_records        DeletionRecord list created from candidates.
+    withholding_records     WithholdingRecord list from FBI 302 series checks.
     records_written         Number of records successfully written to DynamoDB.
     documents_flagged       Number of corpus_veritas_documents records updated.
     comparison_result       Cross-version ComparisonResult, if run.
     gap_report              GapReport, if generated.
     errors                  Any non-fatal errors encountered during persistence.
     """
-    manifest_version:   str
-    reconciliation:     ReconciliationResult
-    deletion_records:   list[DeletionRecord]
-    records_written:    int = 0
-    documents_flagged:  int = 0
-    comparison_result:  Optional[ComparisonResult] = None
-    gap_report:         Optional[GapReport] = None
-    errors:             list[str] = field(default_factory=list)
+    manifest_version:    str
+    reconciliation:      ReconciliationResult
+    deletion_records:    list[DeletionRecord]
+    withholding_records: list[WithholdingRecord] = field(default_factory=list)
+    records_written:     int = 0
+    documents_flagged:   int = 0
+    comparison_result:   Optional[ComparisonResult] = None
+    gap_report:          Optional[GapReport] = None
+    errors:              list[str] = field(default_factory=list)
 
     @property
     def candidate_count(self) -> int:
@@ -231,6 +267,152 @@ def _signals_for_candidate(
 
 
 # ---------------------------------------------------------------------------
+# FBI 302 partial delivery detection
+# ---------------------------------------------------------------------------
+
+def _write_withholding_record(
+    record: WithholdingRecord,
+    dynamodb_client,
+    table_name: str = DELETIONS_TABLE,
+) -> None:
+    """
+    Write one WithholdingRecord to corpus_veritas_deletions.
+
+    Uses the same table as DeletionRecord -- both are gap findings,
+    distinguished by their deletion_flag value (WITHHELD_* vs DELETION_*).
+    """
+    item: dict = {
+        "record_id":             {"S": record.record_id},
+        "deletion_flag":         {"S": record.deletion_flag.value},
+        "confidence_tier":       {"S": record.deletion_flag.confidence_tier},
+        "acknowledgment_source": {"S": record.acknowledgment_source},
+        "acknowledgment_date":   {"S": record.acknowledgment_date},
+        "created_at":            {"S": record.created_at},
+        "document_identifiers":  {"SS": record.document_identifiers},
+        "is_government_acknowledged": {"BOOL": True},
+    }
+    if record.stated_reason:
+        item["stated_reason"] = {"S": record.stated_reason}
+    if record.notes:
+        item["notes"] = {"S": record.notes}
+    if record.sibling_document_ids:
+        item["sibling_document_ids"] = {"SS": record.sibling_document_ids}
+    if record.document_identifiers:
+        item["efta_number"] = {"S": record.document_identifiers[0]}
+
+    dynamodb_client.put_item(TableName=table_name, Item=item)
+
+
+def run_302_series_checks(
+    series_descriptors: list["FBI302SeriesDescriptor"],
+    dynamodb_client,
+    now_date: str = "",
+) -> tuple[list[WithholdingRecord], list[str]]:
+    """
+    Run FBI 302 partial delivery checks for a list of series descriptors.
+
+    For each descriptor, calls check_302_series(). If the result is
+    selective (some released, some withheld), creates a WITHHELD_SELECTIVELY
+    WithholdingRecord and writes it to corpus_veritas_deletions.
+
+    Fully withheld series (none released) produce WITHHELD_ACKNOWLEDGED
+    records -- the absence of any release alongside other released documents
+    in the corpus is itself an acknowledgment pattern.
+
+    Fully released series produce no record.
+
+    Parameters
+    ----------
+    series_descriptors : List of FBI302SeriesDescriptor to check.
+    dynamodb_client    : boto3 DynamoDB client.
+    now_date           : ISO 8601 date string for acknowledgment_date.
+                         Defaults to today if empty.
+
+    Returns
+    -------
+    (withholding_records, errors) tuple.
+    """
+    from datetime import datetime, timezone
+    if not now_date:
+        now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    withholding_records: list[WithholdingRecord] = []
+    errors: list[str] = []
+
+    for descriptor in series_descriptors:
+        try:
+            series_result = check_302_series(
+                series_identifier=descriptor.series_identifier,
+                all_series_ids=descriptor.all_series_ids,
+                released_ids=descriptor.released_ids,
+                total_expected=descriptor.total_expected,
+                notes=descriptor.notes,
+            )
+        except Exception as exc:
+            errors.append(
+                f"check_302_series failed for '{descriptor.series_identifier}': {exc}"
+            )
+            logger.error(
+                "302 series check failed for %s: %s",
+                descriptor.series_identifier, exc,
+            )
+            continue
+
+        if not series_result.withheld_ids:
+            logger.info(
+                "302 series '%s': fully released, no withholding record.",
+                descriptor.series_identifier,
+            )
+            continue
+
+        # Determine flag: WITHHELD_SELECTIVELY if some released, else WITHHELD_ACKNOWLEDGED
+        sibling_ids = series_result.released_ids if series_result.is_selective else []
+        flag = (
+            DeletionFlag.WITHHELD_SELECTIVELY
+            if series_result.is_selective
+            else DeletionFlag.WITHHELD_ACKNOWLEDGED
+        )
+
+        try:
+            record = create_acknowledged_withholding(
+                document_identifiers=series_result.withheld_ids,
+                acknowledgment_source=descriptor.acknowledgment_source,
+                acknowledgment_date=descriptor.acknowledgment_date or now_date,
+                sibling_document_ids=sibling_ids,
+                subject_entities=descriptor.subject_entities,
+                notes=(
+                    f"Series: {descriptor.series_identifier}. "
+                    f"Release rate: {series_result.release_rate or 'unknown'}. "
+                    + (descriptor.notes or "")
+                ).strip(),
+            )
+        except Exception as exc:
+            errors.append(
+                f"WithholdingRecord creation failed for "
+                f"'{descriptor.series_identifier}': {exc}"
+            )
+            continue
+
+        try:
+            _write_withholding_record(record, dynamodb_client)
+            withholding_records.append(record)
+            logger.info(
+                "302 series '%s': %s -- %d withheld, %d released. "
+                "WithholdingRecord written.",
+                descriptor.series_identifier, flag.value,
+                len(series_result.withheld_ids),
+                len(series_result.released_ids),
+            )
+        except Exception as exc:
+            errors.append(
+                f"DynamoDB write failed for series "
+                f"'{descriptor.series_identifier}': {exc}"
+            )
+
+    return withholding_records, errors
+
+
+# ---------------------------------------------------------------------------
 # Primary entry point
 # ---------------------------------------------------------------------------
 
@@ -239,6 +421,7 @@ def run_deletion_pipeline(
     efta_scheme: EFTANumber,
     dynamodb_client=None,
     prior_manifest: Optional[ManifestLoadResult] = None,
+    fbi_302_series: Optional[list] = None,
     generate_report: bool = True,
     public_report: bool = False,
     acknowledgment_source: str = "EFTA index reconciliation",
@@ -264,6 +447,10 @@ def run_deletion_pipeline(
                           created from AWS_REGION.
     prior_manifest      : Optional earlier ManifestLoadResult for
                           cross-version comparison.
+    fbi_302_series      : Optional list of FBI302SeriesDescriptor instances.
+                          If provided, run_302_series_checks() is called and
+                          resulting WithholdingRecords are included in the
+                          pipeline result and gap report.
     generate_report     : Whether to generate a GapReport.
     public_report       : Whether the GapReport should suppress victim
                           identities.
@@ -354,7 +541,17 @@ def run_deletion_pipeline(
                     f"{retro.efta_number}: {exc}"
                 )
 
-    # Step 6: generate report
+    # Step 6: FBI 302 partial delivery checks
+    withholding_records: list[WithholdingRecord] = []
+    if fbi_302_series:
+        w_records, w_errors = run_302_series_checks(
+            fbi_302_series, dynamodb_client, now_date=now
+        )
+        withholding_records.extend(w_records)
+        records_written += len(w_records)
+        errors.extend(w_errors)
+
+    # Step 7: generate report
     gap_report: Optional[GapReport] = None
     if generate_report:
         if comparison_result is not None:
@@ -364,6 +561,7 @@ def run_deletion_pipeline(
         else:
             gap_report = generate_gap_report(
                 deletion_records=deletion_records,
+                withholding_records=withholding_records or None,
                 public=public_report,
             )
 
@@ -381,6 +579,7 @@ def run_deletion_pipeline(
         manifest_version=manifest.release_version,
         reconciliation=reconciliation,
         deletion_records=deletion_records,
+        withholding_records=withholding_records,
         records_written=records_written,
         documents_flagged=documents_flagged,
         comparison_result=comparison_result,
