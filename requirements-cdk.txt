@@ -1,0 +1,10 @@
+# CDK infrastructure dependencies
+# Install separately from requirements.txt -- not needed for pipeline runtime
+# pip install -r requirements-cdk.txt
+
+aws-cdk-lib>=2.100.0
+constructs>=10.0.0
+
+# CDK requires a recent Node.js installation (18+)
+# Install Node.js from https://nodejs.org/ before running cdk commands
+# npm install -g aws-cdk
