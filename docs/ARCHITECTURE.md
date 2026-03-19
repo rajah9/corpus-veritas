@@ -1,9 +1,13 @@
 # Architecture Specification
 
 *Epstein Files AI Analysis System — corpus-veritas*
-*Version 0.2 — March 2026*
+*Version 0.3 — Milestone 7 — March 2026*
 
-> This document is the technical companion to [`CONSTITUTION.md`](../../../Downloads/corpus-veritas-deletion-detector/corpus-veritas/CONSTITUTION.md). Ethical boundaries defined there govern all decisions here. When they conflict, the Constitution governs.
+> This document is the technical companion to [`CONSTITUTION.md`](../CONSTITUTION.md).
+> Ethical boundaries defined there govern all decisions here.
+> When they conflict, the Constitution governs.
+
+**Implementation status:** Layers 1–5 and Milestones 6–7 complete. 855 tests passing. Milestone 8 pending.
 
 ---
 
@@ -12,7 +16,7 @@
 1. [Project Overview](#1-project-overview)
 2. [Architecture: Five Layers](#2-architecture-five-layers)
 3. [Deletion Detection Module](#3-deletion-detection-module)
-4. [Learning Path](#4-learning-path)
+4. [Infrastructure](#4-infrastructure)
 5. [Repository Structure](#5-repository-structure)
 6. [Red Team Audit Framework](#6-red-team-audit-framework)
 7. [Production Roadmap](#7-production-roadmap)
@@ -30,339 +34,158 @@ corpus-veritas answers four classes of question about the publicly released Epst
 | **Inference** | Who might the unnamed individuals in this document be? |
 | **Relationship** | Show all documents connecting Person A to Person B. |
 
-A fifth capability — **deletion detection** — identifies pages and documents present in the DOJ's own index but absent from the public release, following methodology established by NPR's February 2026 investigation.
+A fifth capability — **deletion detection** — identifies pages and documents present in the DOJ index but absent from the public release.
 
 ---
 
 ## 2. Architecture: Five Layers
 
-### Layer 1 — Ingestion & Sanitization Pipeline
+### Layer 1 — Ingestion and Sanitization Pipeline
 
-Runs before any data touches the vector store. Evaluates, verifies, and sanitizes every document. **This is the most ethically critical layer.**
+Sub-Module 1B: `corpus_evaluator.py` runs three sequential checks:
+1. Git history audit (forced pushes, suspicious modification gaps)
+2. Sequence number reconciliation (`EFTANumber` or `BatesNumber`)
+3. Community vetting against `trusted_endorsers.json`
 
-#### Sub-Module 1A: Corpus Discovery (Manual Phase)
+Sub-Module 1C: `sanitizer.py` — Comprehend PII detection, four-rule entity analysis, SQS human review queue. Entity text offsets only in SQS messages.
 
-Rather than processing all DOJ PDFs through OCR from scratch, the pipeline first evaluates pre-processed corpora from GitHub and document journalism platforms.
+Sub-Module 1D: `classifier.py` — UUID assignment, `ClassificationRecord` written to DynamoDB `corpus_veritas_documents`. Priority: `VICTIM_ADJACENT > PROCEDURAL > PERPETRATOR_ADJACENT > UNKNOWN`.
 
-**Workflow:** Research → evaluate → record in `corpus_registry.json` → proceed to 1B.
-
-**Search targets:**
-- GitHub: `epstein files text`, `epstein documents parsed`, `epstein 302`, `epstein DOJ corpus`
-- [MuckRock](https://www.muckrock.com)
-- [DocumentCloud](https://www.documentcloud.org)
-- Internet Archive
-
-**Each `corpus_registry.json` entry records:**
-- GitHub URL and commit hash at time of evaluation
-- Document types covered
-- Presence/absence of Bates stamps
-- Page count vs. DOJ index
-- Star/fork count and known journalistic endorsements
-- `GIT_INTEGRITY` score: `CLEAN`, `REVIEW_RECOMMENDED`, or `REJECTED`
-
-#### Sub-Module 1B: Corpus Verification Pipeline
-
-`pipeline/corpus_evaluator.py` runs three sequential checks. Each check gates the next.
-
-**Check 1 — Git History Audit**
-
-Using the GitHub API, pull full commit history. Flag repos where:
-- Initial and most recent commits differ by >5% of total bytes with no descriptive commit message
-- Forced pushes (`--force`) exist in history
-- Modification gap is suspicious relative to the DOJ release date
-
-Output: `GIT_INTEGRITY` score.
-
-**Check 2 — Sequence Number Reconciliation**
-
-Extract sequence numbers from the corpus using the appropriate `SequenceNumber` scheme and reconcile against the DOJ index manifest. The DOJ Epstein release uses **EFTA numbers** (per-page, sequential across all datasets) — not traditional Bates stamps. Pass an `EFTANumber` instance for Epstein corpora; `BatesNumber` remains supported for other legal corpora.
-
-Produces four counts/lists:
-- `PRESENT` — in both index and corpus
-- `MISSING_FROM_CORPUS` — in index, not in corpus
-- `UNINDEXED` — in corpus, not in index (flag for review)
-- `DELETION_CANDIDATES` — missing numbers *excluding* documented expected gaps (see EFTA note below)
-
-Corpora covering <60% of the index are tagged `PARTIAL_COVERAGE`.
-
-**Check 3 — Community Vetting**
-
-Cross-reference against `trusted_endorsers.json`. Endorsement upgrades `PROVENANCE_UNVERIFIED` to `PROVENANCE_COMMUNITY_VOUCHED`.
-
-#### Sequence Numbering Schemes (`pipeline/sequence_numbers.py`)
-
-The DOJ Epstein release does not use traditional Bates stamps. It uses **EFTA numbers** — assigned per-page (not per-document), sequential across all 12 datasets with no resets at dataset boundaries. This required a scheme-agnostic abstraction.
+#### Sequence Numbering
 
 ```
 SequenceNumber (ABC)
-├── BatesNumber   — traditional legal stamping; all gaps are suspicious
-└── EFTANumber    — EFTA per-page numbering; DS9 gaps are documented/expected
+├── BatesNumber   — all gaps suspicious
+└── EFTANumber    — DS9 692,473 documented gaps are expected_gap_numbers, not deletion_candidates
 ```
 
-The shared reconciliation algorithm (`SequenceNumber.reconcile()`) lives on the base class. Subclasses override only five methods that capture scheme-specific behaviour:
+#### DynamoDB: corpus_veritas_documents
 
-| Method | BatesNumber | EFTANumber |
-|---|---|---|
-| `scheme_name` | `"BATES"` | `"EFTA"` |
-| `validate()` | Matches `PREFIX-DIGITS` or 6+ digit strings | Positive integer strings only |
-| `extract_from_text()` | Regex for Bates stamp patterns | Regex for `EFTA-NNNN` variants |
-| `sort_key()` | `(prefix_str, int)` tuple | `int` |
-| `gap_is_expected()` | Always `False` | `True` for DS9 documented gaps |
-
-**The DS9 gap distinction is critical.** The rhowardstone analysis identified 692,473 EFTA numbers in DS9's range that have no corresponding document in the release. Their status is unknown (withheld, unimaged, or unused tracking slots) but their absence is documented. They must appear in `ReconciliationResult.expected_gap_numbers`, not `deletion_candidates` — otherwise the deletion detector generates thousands of false alarms.
-
-`ReconciliationResult` replaces the former `BatesReconciliationResult` and adds:
-- `expected_gap_numbers` — documented absences, not escalated to deletion detection
-- `deletion_candidates` — true gaps that feed `deletion_detector.py` as `DELETION_SUSPECTED`
-
-The invariant `expected_gap_numbers ∪ deletion_candidates = missing_numbers` is enforced by contract tests in `TestSequenceSchemeContract`.
-
-#### Sub-Module 1C: PII Sanitization
-
-Every document passes through AWS Comprehend PII detection before chunking. Potential victim identities enter a human-review queue. Documents do not proceed until classified.
-
-> ⚠️ **This step is not optional and must be built before any document is embedded — even in prototype mode.** Embedding victim identities into the vector store is very difficult to reverse.
-
-#### Sub-Module 1D: Document Classification & Chain of Custody
-
-Every document receives a UUID, classification tag, and chain-of-custody record in DynamoDB.
-
-| Classification | Meaning |
-|---|---|
-| `VICTIM_ADJACENT` | Contains or references victim identities |
-| `PERPETRATOR_ADJACENT` | Names individuals in connection with alleged conduct |
-| `PROCEDURAL` | Court filings, administrative records |
-| `UNKNOWN` | Requires human classification |
+PK: `document_uuid`. GSIs: `gsi-classification-date`, `gsi-corpus-source`, `gsi-victim-flag` (sparse).
 
 ---
 
-### Layer 2 — Storage & Metadata
+### Layer 2 — Storage and Metadata
 
-Three systems in concert:
-
-| System | Purpose |
+| System | Role |
 |---|---|
-| **Amazon S3** | Raw document storage. Versioned. Object Lock on victim-flagged content. |
-| **DynamoDB** | Document registry, entity table, corpus registry, audit log, deletion manifest. Stores `WithholdingRecord` and `DeletionRecord` objects from `pipeline/deletion_detector.py`. |
-| **OpenSearch Serverless** | Vector store. Every chunk carries the full metadata schema below. |
+| S3 `corpus-veritas-corpus` | Raw documents. Object Lock COMPLIANCE 7yr on victim-flagged. |
+| S3 `corpus-veritas-audit` | Audit logs. Object Lock COMPLIANCE 7yr on all entries. |
+| DynamoDB `corpus_veritas_documents` | Chain of custody |
+| DynamoDB `corpus_veritas_entities` | Named entity registry |
+| DynamoDB `corpus_veritas_deletions` | Gap and withholding findings |
+| OpenSearch `corpus-veritas` / `documents` | kNN vector search, 1024-dim Titan v2 |
 
-#### Chunk Metadata Schema
+#### ChunkMetadata (19 fields)
 
-Every chunk embedded into OpenSearch carries:
+`vector` (kNN, 1024-dim), `victim_flag` (keyword, guardrail fast-path), `confidence_tier`, `sequence_number`, `sequence_scheme`, `document_type`, `named_entities`, `deletion_flag`, `provenance_tag`.
 
-| Field | Values |
-|---|---|
-| `source_document_uuid` | UUID from DynamoDB registry |
-| `sequence_number` | Extracted EFTA number (primary) or Bates stamp; `NULL` if absent |
-| `sequence_scheme` | `"EFTA"` \| `"BATES"` \| `NULL` |
-| `document_date` | ISO 8601 |
-| `document_type` | `FBI_302` \| `CORRESPONDENCE` \| `COURT_FILING` \| `EXHIBIT` \| `OTHER` |
-| `named_entities` | JSON array of NER extractions with type and confidence |
-| `confidence_tier` | See table below |
-| `provenance_tag` | See table below |
-| `victim_flag` | `BOOLEAN` — suppresses chunk from public query paths if `TRUE` |
-| `deletion_flag` | `DELETION_CONFIRMED` \| `DELETION_SUSPECTED` \| `DELETION_POSSIBLE` \| `NULL` |
-| `corpus_source` | `corpus_registry` UUID if from external corpus; `NULL` if `DOJ_DIRECT` |
-
-#### Confidence Tiers
-
-| Tier | Definition |
-|---|---|
-| `CONFIRMED` | Stated explicitly in a primary source with known provenance |
-| `CORROBORATED` | Multiple independent sources converge on the same claim |
-| `INFERRED` | Reasonably implied but not directly stated |
-| `SINGLE_SOURCE` | One document only; cannot be independently verified |
-| `SPECULATIVE` | Possible but evidence is thin or circumstantial |
-
-#### Provenance Tag Hierarchy
-
-| Tag | Level | Meaning |
-|---|---|---|
-| `PROVENANCE_DOJ_DIRECT` | Highest | OCR'd by this pipeline from original DOJ PDF |
-| `PROVENANCE_HASH_VERIFIED` | High | Third-party corpus, SHA-256 matches DOJ original |
-| `PROVENANCE_COMMUNITY_VOUCHED` | Medium-High | Endorsed by known journalists, Bates-reconciled |
-| `PROVENANCE_UNVERIFIED` | Medium | Passed git + Bates checks, no endorsement |
-| `PROVENANCE_FLAGGED` | Low | Failed one or more checks, human review required |
-| `PROVENANCE_REJECTED` | None | Failed critical checks, will not ingest |
+`EmbeddingConfig.opensearch_dimension_mapping` is the single source of truth for vector dimension. CDK stack, `ingestor.py`, and `query_router.py` all derive dimension from this property.
 
 ---
 
 ### Layer 3 — RAG Engine
 
-AWS Bedrock (Claude) with Bedrock Knowledge Bases for retrieval management. Per-query billing — no running server cost during development.
+Direct OpenSearch DSL. Four query types:
 
-#### Multi-Source Convergence Rule
-
-The system will not surface an inference about a living individual unless multiple **independent** documents converge on the same conclusion. Independent means different `source_document_uuid` values with different Bates ranges.
-
-- Count = 1 → `SINGLE_SOURCE` language required
-- Count ≥ 2 → `CORROBORATED`
-- Count ≥ 3 with `document_type` diversity → `CONFIRMED` possible
-
-#### Query Routing
-
-| Query Type | Retrieval Strategy |
+| QueryType | Retrieval Strategy |
 |---|---|
-| Timeline | Named entity + date range, sorted chronologically |
-| Provenance | All chunks matching claim, count source diversity |
-| Inference | Multi-source convergence rule strictly enforced |
-| Relationship | Graph query first, then supporting document chunks |
+| TIMELINE | kNN + date range + entity filter + chronological sort |
+| PROVENANCE | kNN only — maximises coverage for source counting |
+| INFERENCE | kNN — caller must run `convergence_checker.check_convergence()` |
+| RELATIONSHIP | Graph traversal first, kNN fallback |
+
+`victim_flag must_not` filter on every query. Unconditional. Constitution Hard Limit 1.
+
+**Convergence rule:** count=1 → SINGLE_SOURCE; count≥2 → CORROBORATED; count≥3 + type diversity → CONFIRMED. Independence test: different `document_uuid` AND sequence numbers differ by >100.
+
+**Bedrock synthesis:** `claude-sonnet-4-6`. Prompt enforces Hard Limits 1–4 inline. Lowest tier across retrieved chunks constrains language instruction.
 
 ---
 
-### Layer 4 — NER & Relationship Graph
+### Layer 4 — NER and Relationship Graph
 
-AWS Comprehend for baseline NER. Custom entity resolution for disambiguation — Person vs. Organization vs. Location sharing a name (e.g., "Trump" the person vs. "Trump Tower" the building).
+`ner_extractor.py`: Comprehend, threshold 0.90. DynamoDB entity table: PK=canonical_name, SK=entity_type. GSIs: `gsi-entity-type`, `gsi-victim-flag` (sparse), `gsi-document-uuid`.
 
-Entity types tracked: `PERSON`, `ORGANIZATION`, `LOCATION`, `DATE`, `CASE_NUMBER`
+`entity_resolver.py`: three-stage disambiguation (normalisation → alias map → Comprehend linking). Known victim canonical names receive `victim_flag=True`.
 
-Edge types in relationship graph: `ASSOCIATE` | `EMPLOYEE` | `VISITOR` | `ACCUSED` | `ACCUSER` | `WITNESS` | `CORRESPONDENT`
-
-**Learning phase:** NetworkX (Python) serialized to S3.
-**Production:** Migrate to AWS Neptune when graph outgrows in-memory processing.
+`relationship_graph.py`: NetworkX DiGraph. Seven edge types. Three traversal methods all apply `_safe_graph()` victim suppression. JSON to S3. Neptune migration path documented.
 
 ---
 
-### Layer 5 — Ethical Guardrail Layer
+### Layer 5 — Ethical Guardrail
 
-Every response passes four checks before delivery:
+Four checks in order, then audit write:
 
-1. **Victim identity check** — Does the response reference a victim-flagged entity? Suppress and substitute with `[protected identity]` language.
-2. **Inference threshold check** — Was multi-source convergence satisfied for any inference about a living individual? If not, downgrade or suppress.
-3. **Confidence calibration check** — Does response language match the assigned confidence tier? `CONFIRMED` language may only appear for `CONFIRMED` tier claims.
-4. **Audit log write** — Query, response, retrieved chunk UUIDs, provenance tags, and confidence tiers are written to the immutable audit log **before** response delivery. If the write fails, the response is not delivered.
+1. **Victim scan** — regex against known victim names + caller-supplied names → `[protected identity]`
+2. **Inference threshold** — INFERENCE queries: convergence backstop, suppression message if below threshold
+3. **Confidence calibration** — 10 language patterns, hedged replacements for sub-CONFIRMED responses
+4. **Creative content (HL4)** — 13 lexical patterns for hypothetical/speculative framing → full suppression
 
-**Audit log storage:** CloudWatch Logs exported to S3 with Object Lock (Compliance mode, 7-year retention).
+**Audit log:** CloudWatch + S3 Object Lock COMPLIANCE 7yr. Write is delivery prerequisite. `AuditLogFailure` prevents `GuardrailResult` from being returned. Constitution Hard Limit 5.
 
 ---
 
 ## 3. Deletion Detection Module
 
-Implements methodology from NPR's February 2026 investigation. Three independent signals grade each deletion finding:
+Three signals grade each finding: EFTA gap, discovery log entry, document stamp gap.
 
-| Signal | Description |
-|---|---|
-| FBI Serial Number gap | Assigned in Sentinel case management. Gaps = unreleased documents. |
-| Discovery log entry | Prosecution's own catalogue. Entry with no matching release = documented withholding. |
-| Bates / document stamp gap | Sequential numbering. Gap is citable structural fact. |
+| Flag | Signals | Confidence |
+|---|---|---|
+| `REFERENCE_UNRESOLVED` | Internal reference, no entry | SPECULATIVE |
+| `DELETION_POSSIBLE` | 1 | SINGLE_SOURCE |
+| `DELETION_SUSPECTED` | 2 | CORROBORATED |
+| `DELETION_CONFIRMED` | 3 | CONFIRMED |
+| `WITHHELD_SELECTIVELY` | Gov't confirmed; siblings released | CONFIRMED |
+| `WITHHELD_ACKNOWLEDGED` | Gov't confirmed | CONFIRMED |
 
-#### Deletion Flag Taxonomy
+`manifest_loader.py`: CSV ingest, tolerant column detection, EFTA normalisation.
 
-Flags live in `pipeline/models.py` as `DeletionFlag(str, Enum)`. They support ordering operators (`<`, `>`, `<=`, `>=`) — government-acknowledged flags rank above evidence-graded flags.
+`version_comparator.py`: cross-release comparison. Disappeared documents receive `DELETION_CONFIRMED` — all three signals present by construction.
 
-| Flag | Signals / Basis | Confidence Tier | Human Review? |
-|---|---|---|---|
-| `REFERENCE_UNRESOLVED` | Internal reference, no index entry | `SPECULATIVE` | Yes |
-| `DELETION_POSSIBLE` | 1 signal | `SINGLE_SOURCE` | Yes |
-| `DELETION_SUSPECTED` | 2 signals | `CORROBORATED` | No |
-| `DELETION_CONFIRMED` | 3 signals | `CONFIRMED` | No |
-| `WITHHELD_SELECTIVELY` | Gov't confirmed; sibling docs released | `CONFIRMED` | No |
-| `WITHHELD_ACKNOWLEDGED` | Gov't confirmed; no siblings required | `CONFIRMED` | No |
+`deletion_pipeline.py`: end-to-end orchestrator. `FBI302SeriesDescriptor` for partial delivery detection. Selective release → `WITHHELD_SELECTIVELY` with `sibling_document_ids`. Fully withheld → `WITHHELD_ACKNOWLEDGED`.
 
-`WITHHELD_SELECTIVELY` and `WITHHELD_ACKNOWLEDGED` were added following the WSJ's March 2026 reporting that the DOJ confirmed 47,635 files were held offline pending review, and that three FBI 302s from a Trump-related interview series were withheld while a fourth was released.
-
-The government's characterisation of withheld documents (e.g. claims described as "baseless") is stored as `WithholdingRecord.stated_reason` — the DOJ's stated position, not a system finding.
-
-#### FBI 302 Partial Delivery
-
-FBI 302s have rigid structure: interview date, subject, agent, file number. The pipeline detects partially delivered 302s (header present, pages missing) as distinct from completely absent 302s. Both are flagged, with different deletion types.
-
-#### Version Comparison
-
-Each new DOJ release is compared against prior releases for content that appeared before and is now absent. Retroactive deletions receive `DELETION_CONFIRMED` if prior release provides documentary evidence.
+`gap_reporter.py`: markdown reports, public (victim suppression) and technical modes.
 
 ---
 
-## 4. Learning Path
+## 4. Infrastructure
 
-Eight milestones. Each builds on the last. Each teaches specific AWS services.
+CDK stack (`infrastructure/cdk/stack.py`) provisions all resources:
 
-> ⚠️ **Do not skip Milestone 1's victim sanitization step.** Build IAM and PII detection before embedding anything.
+- S3 (two buckets, Object Lock, `RemovalPolicy.RETAIN`)
+- DynamoDB (three tables, all GSIs, PAY_PER_REQUEST, PITR)
+- OpenSearch Serverless (encryption + network + access policies)
+- CloudWatch Logs (10-year retention)
+- IAM (pipeline, query, admin roles with least-privilege permissions)
 
-| # | Milestone | AWS Services | Deliverable |
-|---|---|---|---|
-| 1 | Ingest one document, query with Bedrock | S3, IAM, Bedrock, Lambda | Working prompt → response chain |
-| 2 | Metadata schema + audit log | DynamoDB, CloudWatch | Every chunk has UUID, provenance tag, date |
-| 3 | Real RAG pipeline | OpenSearch Serverless, Bedrock Knowledge Bases | Retrieval-grounded vs. naive prompt comparison |
-| 4 | NER + entity table | Comprehend, DynamoDB | Prince Andrew query returns structured results |
-| 5 | Confidence tier + multi-source logic | Lambda orchestration, LangChain | Inference requires convergence to surface |
-| 6 | Deletion detection module | S3, DynamoDB, Lambda | Bates gap report, `DELETION_SUSPECTED` flags |
-| 7 | Ethical guardrail layer | Bedrock Guardrails, CloudWatch + S3 Object Lock | Every output auditable; victim flag suppresses chunks |
-| 8 | Chat + structured UI | Amplify or ECS, API Gateway | Streamlit prototype → production frontend |
+`cdk deploy` from `infrastructure/cdk/`. See `infrastructure/DEPLOYMENT.md`.
 
-### Cost Management ($50–200/month target)
+**Cost target: $50–200/month.** OpenSearch Serverless is the largest cost — use smallest collection tier.
 
-| Service | Risk | Mitigation |
-|---|---|---|
-| OpenSearch Serverless | Largest recurring cost | Use smallest collection tier; exploit 730-hour free tier |
-| Textract | Surprise bills on large batches | Only invoke for docs not in verified corpus; batch deliberately |
-| Bedrock | Per-token billing | Set `max_tokens` limits; use smaller model for iteration |
-| DynamoDB | Low risk | Use on-demand pricing only |
+**Object Lock buckets cannot be deleted by `cdk destroy`.** This is intentional.
 
 ---
 
 ## 5. Repository Structure
 
-```
-corpus-veritas/
-├── CONSTITUTION.md               # Ethical framework — governs all decisions
-├── ARCHITECTURE.md               # This document
-├── corpus_registry.json          # Authoritative external corpus source list
-├── trusted_endorsers.json        # Community vetting endorser list
-├── requirements.txt
-├── requirements-dev.txt
-├── infrastructure/
-│   ├── cdk/                      # AWS CDK stack definitions
-│   └── iam/                      # IAM role and policy definitions
-├── pipeline/
-│   ├── corpus_evaluator.py       # Sub-module 1B: corpus verification
-│   ├── sanitizer.py              # Sub-module 1C: PII detection
-│   ├── ingestor.py               # Chunk, embed, store
-│   ├── deletion_detector.py      # Deletion detection module
-│   └── entity_resolver.py        # NER + entity disambiguation
-├── rag/
-│   ├── query_router.py           # Route queries to retrieval strategy
-│   ├── convergence_checker.py    # Multi-source convergence rule
-│   └── guardrail.py              # Layer 5 ethical output filter
-├── graph/
-│   └── relationship_graph.py     # NetworkX graph, serialized to S3
-├── api/
-│   └── handler.py                # Lambda handler for API Gateway
-├── ui/
-│   └── app.py                    # Streamlit prototype
-└── tests/
-    ├── integration/              # Integration tests per milestone
-    ├── red_team/                 # Adversarial ethical boundary tests
-    └── fixtures/                 # Synthetic test documents (no real corpus content)
-```
+See [README.md](../README.md) for the full directory listing.
 
 ---
 
 ## 6. Red Team Audit Framework
 
-Adversarial tests run after each milestone and before any production deployment. Stored in `tests/red_team/`. All Hard Limits from `CONSTITUTION.md` Article III must be tested explicitly.
+`tests/red_team/` — required before deployment. Must test all six Hard Limits:
+victim re-identification, confidence manipulation, living individual inference bypass, audit log circumvention, deletion evidence suppression, HL4 creative content bypass.
 
-| Test Category | What It Attempts |
-|---|---|
-| Victim re-identification | Extract suppressed victim identities via indirect queries or multi-step inference |
-| Confidence manipulation | Get `INFERRED` claims surfaced with `CONFIRMED` language |
-| Living individual inference bypass | Name living individuals from single-source evidence via rephrasing |
-| Audit log circumvention | Query in ways that might bypass the audit log write |
-| Deletion evidence suppression | Verify deletion flags surface and are not overridden |
-
-A system that fails a Hard Limit test during red teaming **must not be deployed** until remediated and re-tested.
+**A system that fails a Hard Limit test must not be deployed.**
 
 ---
 
 ## 7. Production Roadmap
 
-Target users: small newsrooms, independent journalists, researchers, and members of the public seeking to separate fact from rumor.
+**Milestone 8 (pending):** `api/handler.py` Lambda handler, `ui/app.py` Streamlit prototype, `tests/red_team/` adversarial tests.
 
-**Two interaction modes:**
+**Graph population gap:** `RelationshipGraph` is not yet auto-populated during ingestion. A `graph_populator.py` module needs to wire entity resolution into the ingest pipeline.
 
-- **Chat mode** — Plain-English exploration. Every response includes provenance tags and confidence tiers inline. Sources cited with document UUIDs and Bates numbers.
-- **Structured view** — Publication-ready output. Timeline visualizations, relationship graphs, deletion manifests.
-
-**Third mode (commercial):** REST API via API Gateway with per-key rate limiting and full audit logging. Newsrooms integrate into their own tools.
-
-Legal review recommended before commercial deployment.
+**Neptune migration:** when in-memory graph exceeds Lambda memory, migrate to AWS Neptune using the `to_dict()` / `from_dict()` JSON format as the migration contract.
