@@ -24,7 +24,7 @@ entertainment. Read [CONSTITUTION.md](CONSTITUTION.md) before contributing.
 | Layer 5 | Ethical Guardrail & Audit Log | ✅ Complete |
 | Milestone 6 | Deletion Detection Pipeline | ✅ Complete |
 | Milestone 7 | Infrastructure as Code (CDK) | ✅ Complete |
-| Milestone 8 | API & UI | 🔲 Pending |
+| Milestone 8 | API & UI | ✅ Complete |
 
 **855 tests passing across all layers.**
 

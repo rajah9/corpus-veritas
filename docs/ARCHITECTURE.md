@@ -7,7 +7,7 @@
 > Ethical boundaries defined there govern all decisions here.
 > When they conflict, the Constitution governs.
 
-**Implementation status:** Layers 1–5 and Milestones 6–7 complete. 855 tests passing. Milestone 8 pending.
+**Implementation status:** All eight milestones complete. 1032 tests passing. System is deployment-ready pending red team sign-off.
 
 ---
 
@@ -175,17 +175,41 @@ See [README.md](../README.md) for the full directory listing.
 
 ## 6. Red Team Audit Framework
 
-`tests/red_team/` — required before deployment. Must test all six Hard Limits:
-victim re-identification, confidence manipulation, living individual inference bypass, audit log circumvention, deletion evidence suppression, HL4 creative content bypass.
+`tests/red_team/` — **complete, 64 tests passing.** Six files covering all six Hard Limits:
+
+| File | Hard Limit | Tests |
+|---|---|---|
+| `test_rl1_victim_reidentification.py` | HL1: victim identity never exposed | 12 |
+| `test_rl2_inference_bypass.py` | HL2: no single-source inference about living individuals | 9 |
+| `test_rl3_confidence_manipulation.py` | HL3: no CONFIRMED language for sub-CONFIRMED tier | 12 |
+| `test_rl4_audit_circumvention.py` | HL5: audit log is delivery prerequisite | 9 |
+| `test_rl5_deletion_suppression.py` | Principle IV: deletion flags surface and cannot be downgraded | 10 |
+| `test_rl6_creative_content.py` | HL4: no creative/speculative content about real individuals | 12 |
 
 **A system that fails a Hard Limit test must not be deployed.**
+
+Run before every deployment: `python -m pytest tests/red_team/ -v`
 
 ---
 
 ## 7. Production Roadmap
 
-**Milestone 8 (pending):** `api/handler.py` Lambda handler, `ui/app.py` Streamlit prototype, `tests/red_team/` adversarial tests.
+**All eight milestones are complete.** The system is deployment-ready pending red team sign-off.
 
-**Graph population gap:** `RelationshipGraph` is not yet auto-populated during ingestion. A `graph_populator.py` module needs to wire entity resolution into the ingest pipeline.
+**Milestone 8 delivered:**
+- `api/handler.py` — Lambda handler, five routes, full guardrail pipeline per request
+- `pipeline/graph_populator.py` — NER → entity_resolver → RelationshipGraph wired
+- `ui/app.py` — Streamlit prototype (Chat + Structured View)
+- `tests/red_team/` — six adversarial test files, all six Hard Limits covered, 1032 tests green
 
-**Neptune migration:** when in-memory graph exceeds Lambda memory, migrate to AWS Neptune using the `to_dict()` / `from_dict()` JSON format as the migration contract.
+**Pre-deployment gate:** run `python -m pytest tests/red_team/ -v` before every release.
+A system that fails a Hard Limit test must not be deployed.
+
+**Neptune migration:** when the in-memory graph exceeds Lambda memory, migrate to AWS Neptune.
+The `RelationshipGraph.to_dict()` / `from_dict()` JSON format is the migration data contract.
+
+**API Gateway:** the CDK stack provisions the Lambda role but not the API Gateway resource.
+Add `AWS::ApiGateway::RestApi` to `infrastructure/cdk/stack.py` for production deployment.
+
+**Streamlit deployment:** `ui/app.py` is a prototype. For production, deploy via AWS Amplify
+or ECS and set `API_ENDPOINT` to the deployed API Gateway URL.
